@@ -163,12 +163,6 @@ class VMDPropertyKeyFrame:
 	var m_ikStates: Array = []
 
 
-static func create(path: String) -> VMDFile:
-	var vmd := VMDFile.new()
-	vmd.setup(path)
-	return vmd
-
-
 ## Returns the bezier control points of one channel as (x1, y1, x2, y2)
 ## normalized to 0..1. MMD stores each channel as 4 bytes spread over a
 ## 16 byte block.
@@ -346,20 +340,6 @@ func _load_property_key_frames(r: VMDReader) -> bool:
 	return true
 
 
-func get_bone_names() -> PackedStringArray:
-	var names := PackedStringArray()
-	for name in m_boneKeyFrames:
-		names.append(name)
-	return names
-
-
-func get_morph_names() -> PackedStringArray:
-	var names := PackedStringArray()
-	for name in m_morphKeyFrames:
-		names.append(name)
-	return names
-
-
 func get_bone_key_frame_count() -> int:
 	var total := 0
 	for name in m_boneKeyFrames:
@@ -371,13 +351,11 @@ func get_bone_key_frame_count() -> int:
 func get_last_frame() -> int:
 	var last := 0
 	for name in m_boneKeyFrames:
-		var keys: Array = m_boneKeyFrames[name]
-		if not keys.is_empty():
-			last = maxi(last, keys[keys.size() - 1].m_frame)
+		for key in m_boneKeyFrames[name]:
+			last = maxi(last, key.m_frame)
 	for name in m_morphKeyFrames:
-		var keys: Array = m_morphKeyFrames[name]
-		if not keys.is_empty():
-			last = maxi(last, keys[keys.size() - 1].m_frame)
+		for key in m_morphKeyFrames[name]:
+			last = maxi(last, key.m_frame)
 	for key in m_cameraKeyFrames:
 		last = maxi(last, key.m_frame)
 	for key in m_lightKeyFrames:

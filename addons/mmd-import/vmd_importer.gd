@@ -144,7 +144,12 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 
 	if skeleton == null:
 		push_warning("MMD: no reference model found for %s, only rotation tracks are imported. Set '%s' in the import dock to bind translations." % [source_file.get_file(), OPTION_REFERENCE_MODEL])
-	print("MMD: bone tracks of %s are relative to '%s'" % [source_file.get_file(), skeleton_path])
+	else:
+		print("MMD: %d of %d animated bones found in the reference skeleton, bone tracks are relative to '%s'" % [
+			VMDAnimationBuilder.count_matching_bones(vmd, skeleton),
+			vmd.m_boneKeyFrames.size(),
+			skeleton_path,
+		])
 
 	var animation := VMDAnimationBuilder.build_bone_animation(vmd, skeleton, skeleton_path, scale, fps)
 	if reference != null:
@@ -157,6 +162,10 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 		push_warning("MMD: %s has no bone key frames, the imported library is empty" % source_file)
 	else:
 		animation.resource_name = animation_name
+		# Keep the duration of the whole motion (morph and camera keys may run
+		# past the last bone key) so playing stops when MMD would stop.
+		if fps > 0.0:
+			animation.length = maxf(animation.length, float(vmd.get_last_frame()) / fps)
 		library.add_animation(animation_name, animation)
 
 	var path := "%s.%s" % [save_path, _get_save_extension()]

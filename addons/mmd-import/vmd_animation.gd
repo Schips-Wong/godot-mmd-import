@@ -85,7 +85,6 @@ static func build_bone_animation(vmd: VMDFile, skeleton: Skeleton3D, skeleton_no
 	animation.step = 1.0 / frame_rate
 	animation.loop_mode = Animation.LOOP_NONE
 
-	var missing := PackedStringArray()
 	var track_count := 0
 	var last_time := 0.0
 
@@ -97,7 +96,6 @@ static func build_bone_animation(vmd: VMDFile, skeleton: Skeleton3D, skeleton_no
 		var rest_origin := Vector3.ZERO
 		if not bone_indices.is_empty():
 			if not bone_indices.has(bone_name):
-				missing.append(bone_name)
 				continue
 			bone_index = bone_indices[bone_name]
 			rest_origin = skeleton.get_bone_rest(bone_index).origin
@@ -125,7 +123,6 @@ static func build_bone_animation(vmd: VMDFile, skeleton: Skeleton3D, skeleton_no
 		return null
 	if last_time > animation.length:
 		animation.length = last_time
-	_report_missing_bones(missing)
 	return animation
 
 
@@ -135,15 +132,3 @@ static func _has_translation(keys: Array) -> bool:
 		if not position.is_zero_approx():
 			return true
 	return false
-
-
-static func _report_missing_bones(missing: PackedStringArray) -> void:
-	if missing.is_empty():
-		return
-	var shown := PackedStringArray()
-	for i in range(mini(missing.size(), 10)):
-		shown.append(missing[i])
-	var message := "MMD: %d bone(s) of the motion file are not present in the reference skeleton: %s" % [missing.size(), ", ".join(shown)]
-	if missing.size() > shown.size():
-		message += " ..."
-	print_verbose(message)
