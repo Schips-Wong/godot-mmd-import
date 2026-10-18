@@ -1,0 +1,24 @@
+[gd_scene format=3 uid="uid://c1anbg5dwn3fj"]
+
+[ext_resource type="PackedScene" uid="uid://dwgp1sk63aorv" path="res://test/琪亚娜—终焉律者_by_神帝宇_b74e1bc0b884bb65b1fc02ff0b2fd8c9/琪亚娜1.0.pmx" id="1_syuel"]
+[ext_resource type="AnimationLibrary" uid="uid://dwslod4skici3" path="res://test/ankha_by_月羡花_2c198da050f05a77ec964a1e18c3ee3a.vmd" id="2_8a8pi"]
+
+[node name="琪亚娜" unique_id=291314316 instance=ExtResource("1_syuel")]
+
+[node name="Bone" parent="." index="0" unique_id=70628944]
+bones/2/rotation = Quaternion(-0.014999435, 0, 0, 0.9998875)
+bones/14/rotation = Quaternion(-0.06994284, 0, 0, 0.99755096)
+bones/15/rotation = Quaternion(-0.019998701, 0, 0, 0.99979997)
+bones/19/rotation = Quaternion(-0.25995752, 0.13048719, 0.34989747, 0.8904869)
+bones/24/rotation = Quaternion(-0.084839806, 0.46996862, 0.6440379, 0.59761775)
+bones/31/rotation = Quaternion(-0.0024821535, -3.82428e-05, 0.6206134, 0.78411275)
+bones/37/rotation = Quaternion(-0.2408484, -0.11466043, -0.33464792, 0.9038008)
+bones/42/rotation = Quaternion(-0.11394043, -0.6507541, -0.55370265, 0.50690246)
+bones/49/rotation = Quaternion(-0.030137546, 0.02052414, -0.49601784, 0.86754644)
+bones/56/rotation = Quaternion(0.024997378, 0, 0, 0.99968755)
+
+[node name="翅膀" parent="Mesh" parent_id_path=PackedInt32Array(97036405) index="2" unique_id=1447320294]
+visible = false
+
+[node name="AnimationPlayer" type="AnimationPlayer" parent="." index="2" unique_id=815314333]
+"libraries/ankha_by_月羡花_2c198da050f05a77ec964a1e18c3ee3a" = ExtResource("2_8a8pi")
