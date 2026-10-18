@@ -11,5 +11,8 @@ About Godot MMD Plugin with gdscript
 - [ ] Generate Godot Rigidbody
 - [ ] Generate Godot Joint
 - [ ] Generate Godot Softbody
-- [ ] Parse VMD File
+- [x] Parse VMD File
+- [x] Generate Godot Animation (bone)
+- [ ] Generate Godot Animation (morph)
+- [ ] Generate Godot Animation (camera / light)
 - [ ] More Powerful
