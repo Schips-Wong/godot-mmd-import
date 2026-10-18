@@ -69,20 +69,20 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String) -> Object:
 	
 	var textureMap: Dictionary[int, StandardMaterial3D] = {}
 	for i in range(pmx.m_textures.size()):
-		var textureName = pmx.m_textures[i].m_textureName
-		if textureName.ends_with("0Nub"):
-			continue
-		var mt3d = StandardMaterial3D.new()
-		var texturePath:String = textureName.replace('\\', '/')
-		var resourcePath:String = base_dir + "/" + texturePath
-
+		var textureName: String = pmx.m_textures[i].m_textureName
+		var texturePath: String = textureName.replace('\\', '/')
+		var resourcePath: String = base_dir + "/" + texturePath
+		var mt3d := StandardMaterial3D.new()
 		mt3d.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 		mt3d.cull_mode = BaseMaterial3D.CULL_BACK
-		mt3d.albedo_texture = load(resourcePath)
 		mt3d.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 		mt3d.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_ALWAYS
 		mt3d.resource_name = texturePath.get_file()
 		mt3d.render_priority = i
+		# "0Nub" is MMD's placeholder for "no texture"; the file usually does
+		# not exist, but the index still has to resolve for the materials.
+		if not textureName.ends_with("0Nub") and FileAccess.file_exists(resourcePath):
+			mt3d.albedo_texture = load(resourcePath)
 		textureMap[i] = mt3d
 
 	# Create Mesh
@@ -124,8 +124,11 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String) -> Object:
 		surfaces[ArrayMesh.ARRAY_WEIGHTS] = weights
 		surfaces[ArrayMesh.ARRAY_INDEX] = indexs
 		var mesh = ImporterMesh.new()
-		
-		mesh.add_surface(Mesh.PRIMITIVE_TRIANGLES, surfaces, [], {}, textureMap[material.m_textureIndex])
+		# PMX stores -1 for materials without a texture.
+		var surface_material: Material = null
+		if textureMap.has(material.m_textureIndex):
+			surface_material = textureMap[material.m_textureIndex]
+		mesh.add_surface(Mesh.PRIMITIVE_TRIANGLES, surfaces, [], {}, surface_material)
 		mesh.set_name(material.m_name)
 
 		var mesh_node = ImporterMeshInstance3D.new()

@@ -71,3 +71,25 @@ MMD 的姿态解算属于运行时逻辑，无法用普通 Animation 轨道表�
 
 需要我现在就按这个方案实现 `MMDPoseSolver` 吗？如果你更希望**导入时烘焙**成纯 Animation（不带运行时节点、但动画体积会到几 MB），也可以改成那种方案。
 ```
+
+### c
+
+部分pmx模型无法导入。
+
+提示：
+ERROR: res://addons/mmd-import/pmx_importer.gd:128 - Out of bounds get index '-1' (on base: 'Dictionary[int, StandardMaterial3D]')
+ERROR: core/io/file_access.cpp:1002 - Condition "f.is_null()" is true. Continuing.
+
+```
+已定位并修复。这个崩溃与元数据常量无关，是 `pmx_importer.gd` 里材质/贴图映射的既有缺陷，只是修改导入器脚本会让 Godot 重新导入所有 `.pmx`，从而把它暴露出来。
+
+原因：
+- PMX 中无贴图材质的 `m_textureIndex` 是 `-1`（`pmx_file.gd` 的 `get_index` 把 `0xFF/0xFFFF` 解码为 `-1`），而 `textureMap[...]` 直接取值，触发 `Out of bounds get index '-1'`。
+- 旧代码遇到名字以 `0Nub` 结尾的贴图会 `continue`，导致 `textureMap` 出现空洞，被引用时同样会崩。
+- 第二行 `file_access.cpp ... f.is_null()` 是对不存在的贴图文件调用 `load()` 造成的报错。
+
+修改（`addons/mmd-import/pmx_importer.gd`）：
+- 每个贴图索引都建立材质条目，`0Nub` 只跳过加载贴图、不再跳过建表。
+- `load()` 前用 `FileAccess.file_exists()` 判断，避免缺失贴图刷错误。
+- 取材质改为 `textureMap.has(...)` 判断，`-1` 时回退到默认材质。
+```
