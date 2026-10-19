@@ -257,13 +257,15 @@ static func _is_ik_enabled(toggles: Dictionary, controller_name: String, frame: 
 
 
 # --------------------------------------------------------------------------
-# IK solver (CCD)
+# IK solver (two bone analytic solution, CCD fallback)
 # --------------------------------------------------------------------------
 
 static func _apply_ik(skeleton: Skeleton3D, entry: Dictionary, global_cache: Dictionary) -> void:
 	var target: int = entry["ik_target"]
 	var links: Array = entry["ik_links"]
 	if target < 0 or target >= skeleton.get_bone_count() or links.is_empty():
+		return
+	if _solve_two_bone(skeleton, entry, links, target, global_cache):
 		return
 	var goal := _global_pose(skeleton, entry["bone"], global_cache).origin
 	var iterations: int = clampi(int(entry["ik_iter"]), 1, MAX_IK_ITERATIONS)
@@ -277,6 +279,93 @@ static func _apply_ik(skeleton: Skeleton3D, entry: Dictionary, global_cache: Dic
 			_rotate_towards(skeleton, link_bone, target, goal, link, global_cache)
 		if _global_pose(skeleton, target, global_cache).origin.distance_to(goal) <= IK_TOLERANCE:
 			break
+
+
+## Solves a two bone chain (thigh + hinged knee, elbow...) in closed form. The
+## knee/elbow angle only depends on the hip to goal distance, so this matches
+## MMD better than CCD and does not get stuck near a straight leg. Returns false
+## when the chain does not have that shape and the CCD fallback has to run.
+static func _solve_two_bone(skeleton: Skeleton3D, entry: Dictionary, links: Array, target: int, global_cache: Dictionary) -> bool:
+	if links.size() != 2:
+		return false
+	var hinge: Dictionary = links[0]
+	var root_link: Dictionary = links[1]
+	if not hinge["limit"]:
+		return false
+	var hinge_bone: int = int(hinge["bone"])
+	var root_bone: int = int(root_link["bone"])
+	if hinge_bone < 0 or root_bone < 0 or hinge_bone >= skeleton.get_bone_count() or root_bone >= skeleton.get_bone_count():
+		return false
+	# The hinge has to be a child of the first link, and the target a child of
+	# the hinge, otherwise the closed form does not apply.
+	if skeleton.get_bone_parent(hinge_bone) != root_bone or skeleton.get_bone_parent(target) != hinge_bone:
+		return false
+	var axis := _free_axis(hinge)
+	if axis == Vector3.ZERO:
+		return false
+	var l1 := skeleton.get_bone_rest(hinge_bone).origin.length()
+	var l2 := skeleton.get_bone_rest(target).origin.length()
+	if l1 <= 0.0 or l2 <= 0.0:
+		return false
+
+	var hip := _global_pose(skeleton, root_bone, global_cache).origin
+	var goal := _global_pose(skeleton, int(entry["bone"]), global_cache).origin
+	var distance := clampf(hip.distance_to(goal), absf(l1 - l2), l1 + l2)
+	var cos_angle := clampf((l1 * l1 + l2 * l2 - distance * distance) / (2.0 * l1 * l2), -1.0, 1.0)
+	var limits_min: Vector3 = hinge["min"]
+	var limits_max: Vector3 = hinge["max"]
+	var bend := clampf(PI - acos(cos_angle), _axis_value(limits_min, axis), _axis_value(limits_max, axis))
+	# The locked axes stay on their limit, which is what the PMX limits say.
+	skeleton.set_bone_pose_rotation(hinge_bone, Quaternion(axis, bend))
+	global_cache.clear()
+
+	# Rotating the whole chain around the hip keeps the solved knee angle and
+	# puts the target exactly on the goal.
+	var reached := _global_pose(skeleton, target, global_cache).origin
+	var to_target := reached - hip
+	var to_goal := goal - hip
+	if to_target.length_squared() < MIN_VECTOR_LENGTH_SQUARED or to_goal.length_squared() < MIN_VECTOR_LENGTH_SQUARED:
+		return true
+	var align_axis := to_target.cross(to_goal)
+	if align_axis.length_squared() < MIN_VECTOR_LENGTH_SQUARED:
+		return true
+	var align := Quaternion(align_axis.normalized(), to_target.angle_to(to_goal))
+	var root_global := _global_pose(skeleton, root_bone, global_cache).basis
+	var parent := skeleton.get_bone_parent(root_bone)
+	var parent_basis := Basis.IDENTITY
+	if parent >= 0:
+		parent_basis = _global_pose(skeleton, parent, global_cache).basis
+	var local_basis := parent_basis.inverse() * (Basis(align) * root_global)
+	skeleton.set_bone_pose_rotation(root_bone, local_basis.get_rotation_quaternion().normalized())
+	global_cache.clear()
+	return true
+
+
+## Returns the only axis a limited link may rotate around, or [constant
+## Vector3.ZERO] when the link locks more than one axis.
+static func _free_axis(link: Dictionary) -> Vector3:
+	var limits_min: Vector3 = link["min"]
+	var limits_max: Vector3 = link["max"]
+	var free := 0
+	var axis := Vector3.ZERO
+	if not is_equal_approx(limits_min.x, limits_max.x):
+		free += 1
+		axis = Vector3.RIGHT
+	if not is_equal_approx(limits_min.y, limits_max.y):
+		free += 1
+		axis = Vector3.UP
+	if not is_equal_approx(limits_min.z, limits_max.z):
+		free += 1
+		axis = Vector3.BACK
+	return axis if free == 1 else Vector3.ZERO
+
+
+static func _axis_value(v: Vector3, axis: Vector3) -> float:
+	if axis == Vector3.RIGHT:
+		return v.x
+	if axis == Vector3.UP:
+		return v.y
+	return v.z
 
 
 static func _rotate_towards(skeleton: Skeleton3D, link_bone: int, target: int, goal: Vector3, link: Dictionary, global_cache: Dictionary) -> void:
