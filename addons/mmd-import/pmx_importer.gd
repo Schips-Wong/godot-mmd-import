@@ -143,8 +143,9 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String) -> Object:
 	return scene
 
 
-## Adds a [MMDPoseSolver] to the skeleton and hands over the bone rules (IK and
-## 付与/append) that Godot's animation system cannot express.
+## Adds a [MMDPoseSolver] to the skeleton and hands over the bone rules. The
+## runtime solver only applies 付与/append; the IK definitions in the same data
+## are used by [MMDIKBaker] to bake the IK chains into VMD animations.
 func _create_pose_solver(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D) -> void:
 	var data := _build_bone_data(pmx)
 	if data.is_empty():
@@ -157,8 +158,9 @@ func _create_pose_solver(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D) -> 
 
 
 ## Collects the MMD specific rules of every bone: the append (付与) parent with
-## its weight and the IK chain with the per link angle limits.
-## The PMX transform order is kept so the solver can process parents first.
+## its weight and the IK chain with the per link angle limits. The runtime
+## [MMDPoseSolver] consumes the append rule, [MMDIKBaker] consumes the IK rule.
+## The PMX transform order is kept so both can process parents first.
 func _build_bone_data(pmx: PMXFile) -> Array:
 	var data: Array = []
 	for i in range(pmx.m_bones.size()):

@@ -9,6 +9,11 @@ class_name VMDImporter extends EditorImportPlugin
 ## most bone names with the motion file. Without a reference model only the
 ## rotation tracks are generated.
 ##
+## IK is precomputed: the reference skeleton is posed frame by frame, the PMX IK
+## chains are solved and the results are written into the animation as normal
+## rotation keys (see [MMDIKBaker]). The imported motion therefore plays without
+## the runtime IK solver.
+##
 ## The track paths are "SkeletonNodePath:BoneName" relative to the player's
 ## root node, so the library can be played by any [AnimationMixer] whose
 ## [member AnimationMixer.root_node] points at the node containing the skeleton:
@@ -143,7 +148,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 		skeleton_path = "Bone"
 
 	if skeleton == null:
-		push_warning("MMD: no reference model found for %s, only rotation tracks are imported. Set '%s' in the import dock to bind translations." % [source_file.get_file(), OPTION_REFERENCE_MODEL])
+		push_warning("MMD: no reference model found for %s, only rotation tracks are imported and IK cannot be baked. Set '%s' in the import dock to bind translations and IK." % [source_file.get_file(), OPTION_REFERENCE_MODEL])
 	else:
 		print("MMD: %d of %d animated bones found in the reference skeleton, bone tracks are relative to '%s'" % [
 			VMDAnimationBuilder.count_matching_bones(vmd, skeleton),
@@ -152,6 +157,8 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 		])
 
 	var animation := VMDAnimationBuilder.build_bone_animation(vmd, skeleton, skeleton_path, scale, fps)
+	if animation != null and skeleton != null:
+		MMDIKBaker.bake(vmd, skeleton, skeleton_path, scale, fps, animation)
 	if reference != null:
 		reference.release()
 

@@ -93,3 +93,7 @@ ERROR: core/io/file_access.cpp:1002 - Condition "f.is_null()" is true. Continuin
 - `load()` 前用 `FileAccess.file_exists()` 判断，避免缺失贴图刷错误。
 - 取材质改为 `textureMap.has(...)` 判断，`-1` 时回退到默认材质。
 ```
+
+### d
+
+对于部分骨骼是采用IK解算的，要不你把这个部分降为普通的动画帧
