@@ -100,4 +100,9 @@ static func _quaternion_power(q: Quaternion, weight: float) -> Quaternion:
 	var angle := q.get_angle()
 	if is_zero_approx(angle):
 		return Quaternion.IDENTITY
-	return Quaternion(q.get_axis(), angle * weight)
+	# get_axis() of a nearly identity quaternion can be very short; the
+	# Quaternion(axis, angle) constructor requires a normalized axis.
+	var axis := q.get_axis()
+	if axis.length_squared() < 1e-12:
+		return Quaternion.IDENTITY
+	return Quaternion(axis.normalized(), angle * weight)

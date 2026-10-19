@@ -207,11 +207,14 @@ func _build_bone_data(pmx: PMXFile) -> Array:
 		if (bone.m_boneFlag & PMXFile.PMXBoneFlags.IK) and not bone.m_ikLinks.is_empty() and bone.m_ikTargetBoneIndex >= 0:
 			var links: Array = []
 			for link in bone.m_ikLinks:
+				# PMX limits are angles in MMD space. The MMD to Godot rotation
+				# conversion mirrors the X and Y axes, so the intervals flip:
+				# a knee limit of [-180, -0.5] becomes [+0.5, +180] in Godot.
 				links.append({
 					"bone": link.m_ikBoneIndex,
 					"limit": link.m_enableLimit != 0,
-					"min": link.m_limitMin,
-					"max": link.m_limitMax,
+					"min": Vector3(-link.m_limitMax.x, -link.m_limitMax.y, link.m_limitMin.z),
+					"max": Vector3(-link.m_limitMin.x, -link.m_limitMin.y, link.m_limitMax.z),
 				})
 			entry["ik_target"] = bone.m_ikTargetBoneIndex
 			entry["ik_iter"] = bone.m_ikIterationCount
