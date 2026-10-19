@@ -9,10 +9,12 @@ class_name VMDImporter extends EditorImportPlugin
 ## most bone names with the motion file. Without a reference model only the
 ## rotation tracks are generated.
 ##
-## IK is precomputed: the reference skeleton is posed frame by frame, the PMX IK
-## chains are solved and the results are written into the animation as normal
-## rotation keys (see [MMDIKBaker]). The imported motion therefore plays without
-## the runtime IK solver.
+## The MMD pose rules are precomputed: the reference skeleton is posed frame by
+## frame, the PMX IK chains and the 付与 (append) rules are evaluated and the
+## results are written into the animation as normal keys (see [MMDPoseBaker]).
+## The imported motion therefore plays without the runtime IK solver, and when
+## the reference model has no [MMDPoseSolver] node the motion is self contained
+## and needs no runtime node at all.
 ##
 ## The track paths are "SkeletonNodePath:BoneName" relative to the player's
 ## root node, so the library can be played by any [AnimationMixer] whose
@@ -156,9 +158,16 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 			skeleton_path,
 		])
 
+	# The 付与 rule is applied by the runtime solver when the model has one,
+	# otherwise it is baked into the motion so the animation is self contained.
+	var bake_append := false
+	if skeleton != null and skeleton.get_node_or_null(PMXImporter.SOLVER_NODE_NAME) == null:
+		bake_append = true
+		print("MMD: reference model has no runtime pose solver, 付与 is baked into the motion")
+
 	var animation := VMDAnimationBuilder.build_bone_animation(vmd, skeleton, skeleton_path, scale, fps)
 	if animation != null and skeleton != null:
-		MMDIKBaker.bake(vmd, skeleton, skeleton_path, scale, fps, animation)
+		MMDPoseBaker.bake(vmd, skeleton, skeleton_path, scale, fps, animation, bake_append)
 	if reference != null:
 		reference.release()
 

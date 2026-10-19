@@ -97,3 +97,104 @@ ERROR: core/io/file_access.cpp:1002 - Condition "f.is_null()" is true. Continuin
 ### d
 
 对于部分骨骼是采用IK解算的，要不你把这个部分降为普通的动画帧
+
+### e
+
+为 IK link 骨和付与骨建轨道，付与含位移时额外建 POSITION_3D 轨。
+
+让`IK 和付与（append）现在都能在导入时烘焙成普通动画帧，并且可以完全不依赖运行时节点`。
+
+```
+已完成。IK 和付与（append）现在都能在导入时烘焙成普通动画帧，并且可以完全不依赖运行时节点。
+
+## 改动
+
+**新增 `addons/mmd-import/mmd_pose_baker.gd`**（替代原 `mmd_ik_baker.gd`）
+- `bake(..., bake_append)`：逐帧采样 → 按 PMX 变形顺序执行「付与 → IK」→ 写键；
+- 同时为 IK link 骨和付与骨建轨道，付与含位移时额外建 `POSITION_3D` 轨；
+- 每帧重置未被 VMD 驱动的受规则影响骨骼，避免累积；
+- 返回并打印烘焙骨骼数与帧数。
+
+**`pmx_importer.gd`**
+- 新增导入选项 `mmd/runtime_pose_solver`（默认 `true`）；
+- 关闭后不创建 `MMDPoseSolver` 节点，但 `mmd_bone_data` 元数据仍写入（烘焙器需要）。
+
+**`vmd_importer.gd`**
+- 参考模型没有 `MMDPoseSolver` 节点时自动 `bake_append = true`，并打印提示；
+- 有求解器时保持原行为（只烘焙 IK），避免付与被算两遍。
+
+## 实测（临时工程 headless 重导入 `琪亚娜1.0.pmx` + `ankha.vmd`）
+
+| | 默认（求解器开） | 关闭求解器 |
+|---|---|---|
+| 日志 | `baked 6 bones (付与 baked: false)` | `baked 34 bones (付与 baked: true)` |
+| 动画 `.res` | 311 KB | **1.31 MB** |
+| `右足D/右ひざD/右肩C/右腕捩1` | 各 1 键 | 各 1493 键 |
+| 场景内 `MMDPoseSolver` | 有 | 无 |
+| D 骨 vs 腿骨旋转差 | — | 0.00° / 0.04°（正确跟随 IK 后的腿） |
+
+无 IK、无付与的模型不受影响，`bake` 会直接返回 0。
+
+## 使用注意
+
+1. 在 PMX 的导入面板取消 `MMD/runtime_pose_solver` 后，需要**手动重新导入对应的 VMD**——VMD 不会自动依赖 PMX。
+2. 烘焙后的动作不要再加载 `MMDPoseSolver`，否则付与会叠加两次。
+3. 该模式下所有动画都必须是烘焙过的；手工制作的 Animation 不会有付与效果。
+```
+
+使用注意是什么意思，我不是很明白
+
+```
+这两条说的是“切换烘焙模式时的两个坑”，不是报错，我拆开解释。
+
+## 注意 1：切换 PMX 选项后，旧的 VMD 不会自动重烘焙
+
+原因：付与是否烘焙，是 **VMD 导入那一刻**根据参考模型有没有 `MMDPoseSolver` 节点判断的。VMD 导入器只是临时 `load` 了 PMX 场景，Godot 并不会把 PMX 记成 VMD 的导入依赖（`.vmd.import` 的 `[deps]` 里只有它自己）。
+
+所以会出现这种状态：
+
+```
+PMX：已关闭求解器   → 场景里没有 MMDPoseSolver
+VMD：还是旧的 .res  → 付与没烘焙，靠求解器
+```
+
+结果就是 `右足D`、`右ひざD`、`右腕捩1`、`右肩C` 这些骨既不继承、也没有烘焙数据 → 腿/手臂的蒙皮形变会不对劲。
+
+**做法**：改完 `.pmx` 的导入面板后，对每个 `.vmd` 执行一次 **Reimport**（资源面板右键 → Reimport，或在导入面板点“重新导入”）。日志里出现这两行就说明生效了：
+
+```
+MMD: reference model has no runtime pose solver, 付与 is baked into the motion
+MMD: baked 34 bones over 1493 frames (付与 baked: true)
+```
+
+反过来，把选项改回开启时，也要再重导一次 VMD，日志会变回 `付与 baked: false`。
+
+## 注意 2：烘焙后的动作不能再配求解器
+
+付与本质是「子骨 = 自己的动画姿态 × 父骨带来的增量」。烘焙已经把这个增量乘进去了：
+
+- `右腕捩1`：0.25 × 右腕
+- `右肩C`：-1.0 × 右肩P（取反）
+- `右足D`：1.0 × 右足
+
+如果动画里已经写好了结果，运行时 `MMDPoseSolver` 又算一遍，就等于乘了两次：捩骨从 25% 变成约 50%，`右肩C` 的 -1 再乘一次会抵消回正向。
+
+所以两种模式是二选一：
+
+| | 模型带求解器 | 模型不带求解器 |
+|---|---|---|
+| VMD 烘焙 | 只烘焙 IK | IK + 付与 都烘焙 |
+| 付与由谁算 | `MMDPoseSolver` 每帧算 | 动画数据本身 |
+| 手工做的 Animation | 有付与效果 | **没有**付与效果 |
+
+表格最后一行就是注意 3 的来源：不带求解器时，只有经过 `VMDImporter` 烘焙的动作才有付与；你自己在动画编辑器里手 K 的动画、或从别处导入的动画，捩骨/D 骨不会跟随。
+
+## 建议的切换流程
+
+1. 选中 `.pmx` → 导入面板 → 取消 `MMD/runtime_pose_solver` → 重新导入；
+2. 对所有需要用的 `.vmd` 逐个 Reimport；
+3. 打开导入后的模型检查 `Bone` 下没有 `MMDPoseSolver` 节点，动画里 `右足D` 等骨有 1493 帧键；
+4. 想改回运行时方案就反向操作，并再次 Reimport VMD。
+
+如果嫌第 2 步麻烦，可以保持默认（求解器开启 + 只烘焙 IK），效果与改动前完全一致；纯 Animation 模式适合确定要导出、不想带运行时节点的场景。
+```

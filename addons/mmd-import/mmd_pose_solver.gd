@@ -9,7 +9,9 @@ class_name MMDPoseSolver extends SkeletonModifier3D
 ## Bones are processed in the PMX transform order.
 ##
 ## IK is not solved at runtime: [VMDImporter] bakes the IK chains into ordinary
-## rotation tracks, see [MMDIKBaker].
+## rotation tracks, see [MMDPoseBaker]. The 付与 rule is baked as well when the
+## model was imported with "mmd/runtime_pose_solver" disabled; such a model has
+## no [MMDPoseSolver] node and its baked motions play without any runtime node.
 ##
 ## The bone data is written by [PMXImporter] into the [Skeleton3D] metadata
 ## "mmd_bone_data". The engine runs this node after the [AnimationMixer] and
@@ -65,7 +67,7 @@ static func sort_entries(a: Dictionary, b: Dictionary) -> bool:
 # 付与 (append / grant)
 # --------------------------------------------------------------------------
 
-## Applies the append rule of one bone. Also used by [MMDIKBaker] to recreate
+## Applies the append rule of one bone. Also used by [MMDPoseBaker] to recreate
 ## the runtime pose while solving IK at import time.
 static func apply_append(skeleton: Skeleton3D, entry: Dictionary) -> void:
 	var bone: int = entry["bone"]

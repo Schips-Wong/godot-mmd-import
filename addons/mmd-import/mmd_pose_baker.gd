@@ -1,17 +1,20 @@
-class_name MMDIKBaker
+class_name MMDPoseBaker
 
-## Bakes the IK chains of a PMX model into ordinary animation tracks.
+## Bakes the MMD pose rules into ordinary animation tracks at import time.
 ##
-## MMD solves IK at playback time, but the result only depends on the motion and
-## the rest pose, so it can be precomputed: the VMD importer samples the pose of
-## every frame, runs the PMX CCD solver on the reference skeleton and writes the
-## resulting chain rotations as normal rotation keys. Playing the animation no
-## longer needs the IK data, only the 付与 rules handled by [MMDPoseSolver].
+## [b]IK[/b]: MMD solves IK at playback time, but the result only depends on the
+## motion and the rest pose, so it can be precomputed. The VMD importer samples
+## the pose of every frame, runs the PMX CCD solver on the reference skeleton and
+## writes the chain rotations as normal rotation keys.
 ##
-## The IK definitions are read from the [Skeleton3D] metadata written by
-## [PMXImporter]. The solver mirrors the MMD behaviour: links are rotated around
-## their own origin, the PMX angle limits are applied per local axis and the
-## per-bone transform order of the PMX is respected.
+## [b]付与 (append / grant)[/b]: a bone inherits a weighted part of another bone's
+## animation transform. It is baked as well when the reference model has no
+## [MMDPoseSolver] node, so the motion plays without any runtime node.
+##
+## The rules are read from the [Skeleton3D] metadata written by [PMXImporter].
+## The bones are evaluated in the PMX transform order, which is the order MMD
+## uses too: the 付与 rule of a bone runs first, then its IK chain.
+
 
 const DATA_META := "mmd_bone_data"
 
@@ -21,9 +24,10 @@ const MAX_IK_ITERATIONS := 255
 const MIN_VECTOR_LENGTH_SQUARED := 1e-10
 
 
-## Writes baked rotation keys for every IK driven bone of [param skeleton] into
-## [param animation]. Returns the number of bones that were baked.
-static func bake(vmd: VMDFile, skeleton: Skeleton3D, skeleton_node_path: String, scale: float, fps: float, animation: Animation) -> int:
+## Writes baked keys for every bone driven by IK and, when [param bake_append] is
+## set, for every bone driven by 付与 into [param animation]. Returns the number
+## of baked bones.
+static func bake(vmd: VMDFile, skeleton: Skeleton3D, skeleton_node_path: String, scale: float, fps: float, animation: Animation, bake_append: bool) -> int:
 	if vmd == null or skeleton == null or animation == null or skeleton_node_path.is_empty():
 		return 0
 	if not skeleton.has_meta(DATA_META):
@@ -40,11 +44,12 @@ static func bake(vmd: VMDFile, skeleton: Skeleton3D, skeleton_node_path: String,
 		return 0
 	entries.sort_custom(MMDPoseSolver.sort_entries)
 
-	var ik_entries: Array = []
+	var has_rules := false
 	for entry in entries:
-		if int(entry["ik_target"]) >= 0 and not (entry["ik_links"] as Array).is_empty():
-			ik_entries.append(entry)
-	if ik_entries.is_empty():
+		if int(entry["ik_target"]) >= 0 or (bake_append and int(entry["append"]) >= 0):
+			has_rules = true
+			break
+	if not has_rules:
 		return 0
 
 	var frame_rate := fps if fps > 0.0 else 30.0
@@ -53,33 +58,45 @@ static func bake(vmd: VMDFile, skeleton: Skeleton3D, skeleton_node_path: String,
 	for i in range(bone_count):
 		bone_indices[skeleton.get_bone_name(i)] = i
 
-	# Make sure every IK driven bone has a rotation track, even when the motion
-	# has no key of its own (for example a knee moved by the leg IK only).
 	var rotation_tracks := {}
+	var position_tracks := {}
 	for track in range(animation.get_track_count()):
-		if animation.track_get_type(track) != Animation.TYPE_ROTATION_3D:
-			continue
-		rotation_tracks[String(animation.track_get_path(track).get_concatenated_subnames())] = track
+		var track_bone := String(animation.track_get_path(track).get_concatenated_subnames())
+		match animation.track_get_type(track):
+			Animation.TYPE_ROTATION_3D:
+				rotation_tracks[track_bone] = track
+			Animation.TYPE_POSITION_3D:
+				position_tracks[track_bone] = track
 
-	var baked: Dictionary = {}
-	for entry in ik_entries:
-		for link in entry["ik_links"]:
-			var link_bone: int = int(link["bone"])
-			if link_bone < 0 or link_bone >= bone_count or baked.has(link_bone):
+	# Every bone modified by a rule needs a key on every frame: it has no keys of
+	# its own in the motion (a knee moved by the leg IK only, a twist bone...).
+	var baked_rotation := {}
+	var baked_position := {}
+	var ik_entries: Array = []
+	for entry in entries:
+		var links: Array = entry["ik_links"]
+		if int(entry["ik_target"]) >= 0 and not links.is_empty():
+			ik_entries.append(entry)
+			for link in links:
+				var link_bone: int = int(link["bone"])
+				if link_bone < 0 or link_bone >= bone_count:
+					continue
+				var link_name := skeleton.get_bone_name(link_bone)
+				baked_rotation[link_bone] = _ensure_track(animation, rotation_tracks, skeleton_node_path, link_name, Animation.TYPE_ROTATION_3D)
+		if bake_append and int(entry["append"]) >= 0:
+			var append_bone: int = int(entry["bone"])
+			if append_bone < 0 or append_bone >= bone_count:
 				continue
-			var link_name := skeleton.get_bone_name(link_bone)
-			var track: int = rotation_tracks.get(link_name, -1)
-			if track < 0:
-				track = animation.add_track(Animation.TYPE_ROTATION_3D)
-				animation.track_set_path(track, NodePath("%s:%s" % [skeleton_node_path, link_name]))
-				animation.track_set_interpolation_type(track, Animation.INTERPOLATION_LINEAR)
-				rotation_tracks[link_name] = track
-			baked[link_bone] = track
-	if baked.is_empty():
+			var append_name := skeleton.get_bone_name(append_bone)
+			baked_rotation[append_bone] = _ensure_track(animation, rotation_tracks, skeleton_node_path, append_name, Animation.TYPE_ROTATION_3D)
+			if entry["pos"]:
+				baked_position[append_bone] = _ensure_track(animation, position_tracks, skeleton_node_path, append_name, Animation.TYPE_POSITION_3D)
+
+	if baked_rotation.is_empty() and baked_position.is_empty():
 		return 0
 
-	# Sampling state of every bone animated by the file. Keys are walked with a
-	# cursor because the frames are processed in ascending order.
+	# Sampling state of every bone animated by the file. The keys are walked with
+	# a cursor because the frames are processed in ascending order.
 	var samples := {}
 	var last_frame := 0
 	for bone_name in vmd.m_boneKeyFrames:
@@ -99,14 +116,16 @@ static func bake(vmd: VMDFile, skeleton: Skeleton3D, skeleton_node_path: String,
 		if not states.is_empty():
 			last_frame = maxi(last_frame, int(states[states.size() - 1][0]))
 
-	# Bones whose pose is modified by the solver and therefore has to be
-	# restored from the motion before every frame is evaluated.
+	# Bones whose pose is modified by a rule and therefore has to be restored
+	# from the motion before every frame is evaluated.
 	var modified_bones := {}
-	for bone in baked:
-		modified_bones[bone] = true
 	for entry in entries:
 		if int(entry["append"]) >= 0:
 			modified_bones[int(entry["bone"])] = true
+	for bone in baked_rotation:
+		modified_bones[bone] = true
+	for bone in baked_position:
+		modified_bones[bone] = true
 
 	var global_cache := {}
 	for frame in range(last_frame + 1):
@@ -117,6 +136,7 @@ static func bake(vmd: VMDFile, skeleton: Skeleton3D, skeleton_node_path: String,
 				_reset_to_rest(skeleton, bone)
 		global_cache.clear()
 
+		# Same order as MMD: 付与 of a bone, then the IK chain of that bone.
 		for entry in entries:
 			if int(entry["append"]) >= 0:
 				MMDPoseSolver.apply_append(skeleton, entry)
@@ -129,12 +149,31 @@ static func bake(vmd: VMDFile, skeleton: Skeleton3D, skeleton_node_path: String,
 				_apply_ik(skeleton, entry, global_cache)
 
 		var time := float(frame) / frame_rate
-		for bone in baked:
-			animation.rotation_track_insert_key(baked[bone], time, skeleton.get_bone_pose_rotation(bone))
+		for bone in baked_rotation:
+			animation.rotation_track_insert_key(baked_rotation[bone], time, skeleton.get_bone_pose_rotation(bone))
+		for bone in baked_position:
+			animation.position_track_insert_key(baked_position[bone], time, skeleton.get_bone_pose_position(bone))
 
 	animation.length = maxf(animation.length, float(last_frame) / frame_rate)
-	print("MMD: baked IK of %d bones over %d frames" % [baked.size(), last_frame + 1])
-	return baked.size()
+	var baked_bones := {}
+	for bone in baked_rotation:
+		baked_bones[bone] = true
+	for bone in baked_position:
+		baked_bones[bone] = true
+	print("MMD: baked %d bones over %d frames (付与 baked: %s)" % [baked_bones.size(), last_frame + 1, bake_append])
+	return baked_bones.size()
+
+
+## Returns the track of [param bone_name], creating it when the motion has no
+## track for that bone yet.
+static func _ensure_track(animation: Animation, tracks: Dictionary, skeleton_node_path: String, bone_name: String, type: int) -> int:
+	if tracks.has(bone_name):
+		return tracks[bone_name]
+	var track := animation.add_track(type)
+	animation.track_set_path(track, NodePath("%s:%s" % [skeleton_node_path, bone_name]))
+	animation.track_set_interpolation_type(track, Animation.INTERPOLATION_LINEAR)
+	tracks[bone_name] = track
+	return track
 
 
 static func _sort_keys(a: VMDFile.VMDBoneKeyFrame, b: VMDFile.VMDBoneKeyFrame) -> bool:

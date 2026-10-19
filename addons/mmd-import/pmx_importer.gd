@@ -1,19 +1,29 @@
 class_name PMXImporter extends EditorSceneFormatImporter
 
-## Skeleton3D metadata consumed by MMDPoseSolver (see mmd_pose_solver.gd).
+## Skeleton3D metadata consumed by MMDPoseSolver and MMDPoseBaker.
 const BONE_DATA_META := "mmd_bone_data"
 const SOLVER_NODE_NAME := "MMDPoseSolver"
+
+## Adds the runtime [MMDPoseSolver] node that applies 付与 (append). Disable it
+## when the motions are baked by [MMDPoseBaker], which writes the 付与 result
+## into the animation instead. The bone data metadata is written either way.
+const OPTION_RUNTIME_SOLVER := "mmd/runtime_pose_solver"
 
 
 func _get_extensions() -> PackedStringArray:
 	return PackedStringArray(["pmx"])
 
-func _import_scene(path: String, _flags: int, _options: Dictionary) -> Object:
+func _get_import_options(_path: String) -> void:
+	add_import_option(OPTION_RUNTIME_SOLVER, true)
+
+
+func _import_scene(path: String, _flags: int, options: Dictionary) -> Object:
 	var pmx = PMXFile.new()
 	pmx.setup(path)
 	pmx.scale(0.1)
 	pmx_transform_to_godot(pmx)
-	return create_mesh_node(pmx, 0.1, path.get_base_dir())
+	var runtime_solver := bool(options.get(OPTION_RUNTIME_SOLVER, true))
+	return create_mesh_node(pmx, 0.1, path.get_base_dir(), runtime_solver)
 
 
 func pmx_transform_to_godot(pmx):
@@ -26,7 +36,7 @@ func pmx_transform_to_godot(pmx):
 	pass
 
 
-func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String) -> Object:
+func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solver: bool = true) -> Object:
 	var scene = Node3D.new()
 	var root_node = Node3D.new()
 	var bone_node = Skeleton3D.new()
@@ -61,7 +71,7 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String) -> Object:
 			position = bone.m_position
 		bone_node.set_bone_rest(i, Transform3D(Basis.IDENTITY, position))
 
-	_create_pose_solver(pmx, bone_node, scene)
+	_create_pose_solver(pmx, bone_node, scene, runtime_solver)
 
 	# Create Skin
 	for bone in pmx.m_bones:
@@ -143,14 +153,18 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String) -> Object:
 	return scene
 
 
-## Adds a [MMDPoseSolver] to the skeleton and hands over the bone rules. The
-## runtime solver only applies 付与/append; the IK definitions in the same data
-## are used by [MMDIKBaker] to bake the IK chains into VMD animations.
-func _create_pose_solver(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D) -> void:
+## Stores the bone rules in the skeleton metadata and, unless the project works
+## with baked motions, adds a [MMDPoseSolver] that applies 付与 (append) at
+## runtime. The IK definitions in the same data are consumed by [MMDPoseBaker]
+## to bake the IK chains and, when the solver is absent, the 付与 result into
+## VMD animations.
+func _create_pose_solver(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, runtime_solver: bool) -> void:
 	var data := _build_bone_data(pmx)
 	if data.is_empty():
 		return
 	bone_node.set_meta(BONE_DATA_META, data)
+	if not runtime_solver:
+		return
 	var solver := MMDPoseSolver.new()
 	solver.name = SOLVER_NODE_NAME
 	bone_node.add_child(solver)
@@ -159,7 +173,7 @@ func _create_pose_solver(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D) -> 
 
 ## Collects the MMD specific rules of every bone: the append (付与) parent with
 ## its weight and the IK chain with the per link angle limits. The runtime
-## [MMDPoseSolver] consumes the append rule, [MMDIKBaker] consumes the IK rule.
+## [MMDPoseSolver] consumes the append rule, [MMDPoseBaker] consumes both.
 ## The PMX transform order is kept so both can process parents first.
 func _build_bone_data(pmx: PMXFile) -> Array:
 	var data: Array = []
