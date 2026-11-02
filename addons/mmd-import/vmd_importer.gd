@@ -12,9 +12,11 @@ class_name VMDImporter extends EditorImportPlugin
 ## The MMD pose rules are precomputed: the reference skeleton is posed frame by
 ## frame, the PMX IK chains and the 付与 (append) rules are evaluated and the
 ## results are written into the animation as normal keys (see [MMDPoseBaker]).
-## The imported motion therefore plays without the runtime IK solver, and when
-## the reference model has no [MMDPoseSolver] node the motion is self contained
-## and needs no runtime node at all.
+## The imported motion is self contained: it plays identically without a
+## [MMDPoseSolver] node, so exported games, exported glTF files and third party
+## projects get the correct pose from the keys alone. A solver that is still
+## present in the model detects baked motions and skips 付与 instead of applying
+## it twice.
 ##
 ## The track paths are "SkeletonNodePath:BoneName" relative to the player's
 ## root node, so the library can be played by any [AnimationMixer] whose
@@ -30,6 +32,16 @@ const OPTION_SCALE := "mmd/scale"
 const OPTION_FPS := "mmd/fps"
 const OPTION_REFERENCE_MODEL := "mmd/reference_model"
 const OPTION_SKELETON_PATH := "mmd/skeleton_path"
+
+## How the MMD pose rules are baked into the motion.
+## [constant BAKE_IK] solves the IK chains of the reference model and bakes the
+## result together with 付与, which matches MMD the closest.
+## [constant BAKE_PLAIN] bakes only 付与 and keeps the rotation keys of the file,
+## so no IK correction is applied (useful when the IK result is not wanted, for
+## example for motions authored for another rig).
+const OPTION_BAKE_IK := "mmd/bake_ik"
+const BAKE_IK := 0
+const BAKE_PLAIN := 1
 
 const VMD_EXTENSION := "vmd"
 const REFERENCE_SEARCH_DEPTH := 2
@@ -98,6 +110,13 @@ func _get_import_options(_path: String, _preset_index: int) -> Array[Dictionary]
 			"hint_string": "1,240,0.001",
 		},
 		{
+			"name": OPTION_BAKE_IK,
+			"default_value": BAKE_IK,
+			"property_hint": PROPERTY_HINT_ENUM,
+			#"hint_string": "IK 解算烘焙,普通烘焙 (仅付与)",
+			"hint_string": "IK 解算烘焙",
+		},
+		{
 			"name": OPTION_REFERENCE_MODEL,
 			"default_value": "",
 			"property_hint": PROPERTY_HINT_FILE,
@@ -130,6 +149,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 	var fps := float(options.get(OPTION_FPS, 30.0))
 	var requested_reference := String(options.get(OPTION_REFERENCE_MODEL, ""))
 	var skeleton_path := String(options.get(OPTION_SKELETON_PATH, ""))
+	var bake_ik := int(options.get(OPTION_BAKE_IK, BAKE_IK)) != BAKE_PLAIN
 
 	print("MMD: motion '%s' (%s): %d bones, %d bone keys, %d morph keys, %d frames" % [
 		vmd.m_header.m_modelName,
@@ -158,16 +178,18 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 			skeleton_path,
 		])
 
-	# The 付与 rule is applied by the runtime solver when the model has one,
-	# otherwise it is baked into the motion so the animation is self contained.
-	var bake_append := false
-	if skeleton != null and skeleton.get_node_or_null(PMXImporter.SOLVER_NODE_NAME) == null:
-		bake_append = true
-		print("MMD: reference model has no runtime pose solver, 付与 is baked into the motion")
+	# 付与 is always baked, so the library is self contained: it needs no runtime
+	# solver and stays correct when the model is exported without this addon. A
+	# solver node in the model skips baked motions, so nothing is applied twice.
+	var bake_append := skeleton != null
+	if bake_append:
+		print("MMD: 付与 is baked into the motion, the library needs no runtime solver")
+	if not bake_ik:
+		print("MMD: IK solving is disabled, the rotation keys of the motion are kept")
 
 	var animation := VMDAnimationBuilder.build_bone_animation(vmd, skeleton, skeleton_path, scale, fps)
 	if animation != null and skeleton != null:
-		MMDPoseBaker.bake(vmd, skeleton, skeleton_path, scale, fps, animation, bake_append)
+		MMDPoseBaker.bake(vmd, skeleton, skeleton_path, scale, fps, animation, bake_append, bake_ik)
 	if reference != null:
 		reference.release()
 

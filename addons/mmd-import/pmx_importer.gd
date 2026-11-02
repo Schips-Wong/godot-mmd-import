@@ -4,9 +4,11 @@ class_name PMXImporter extends EditorSceneFormatImporter
 const BONE_DATA_META := "mmd_bone_data"
 const SOLVER_NODE_NAME := "MMDPoseSolver"
 
-## Adds the runtime [MMDPoseSolver] node that applies 付与 (append). Disable it
-## when the motions are baked by [MMDPoseBaker], which writes the 付与 result
-## into the animation instead. The bone data metadata is written either way.
+## Adds the runtime [MMDPoseSolver] node that applies 付与 (append) to motions
+## that do not contain it yet. Imported VMD motions are baked by [MMDPoseBaker]
+## and skipped by the solver, so the node is only needed for motions authored
+## elsewhere; disable it for models that only play baked motions. The bone data
+## metadata is written either way.
 const OPTION_RUNTIME_SOLVER := "mmd/runtime_pose_solver"
 
 
@@ -50,8 +52,15 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solv
 	
 	scene.add_child(bone_node)
 	bone_node.set_owner(scene)
-	
-	scene.add_child(root_node)
+
+	# The mesh group is nested under the skeleton on purpose: Godot's retarget
+	# import options (retarget/bone_map + unique_node/make_unique) rename the
+	# Skeleton3D node *after* this importer ran, without fixing the skeleton
+	# paths of the meshes. A sibling path like "../../Bone" then points to a
+	# node that no longer exists, the Skin is never applied and the mesh stays
+	# frozen while the bones animate. "../../" resolves through the hierarchy,
+	# so it survives any rename of the skeleton node.
+	bone_node.add_child(root_node)
 	root_node.set_owner(scene)
 
 	# Create Bones
