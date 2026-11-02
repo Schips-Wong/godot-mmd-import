@@ -7,7 +7,7 @@ About Godot MMD Plugin with gdscript
 - [x] Generate Godot Skeleton3D Tree
 - [x] Generate Godot Skin
 - [x] Generate Godot Mesh
-- [ ] Generate Godot Morph
+- [x] Generate Godot Morph (vertex morphs as blend shapes)
 - [ ] Generate Godot Rigidbody
 - [ ] Generate Godot Joint
 - [ ] Generate Godot Softbody

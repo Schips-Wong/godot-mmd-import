@@ -287,3 +287,11 @@ ref.glb 的动画第一帧在 **t = 1/30**，不是 0（Blender 从第 1 帧导�
 
 两种模式下动画都是自包含的，导出的项目无需 solver。
 ```
+
+## v2
+
+### a
+
+我在网上看到一个同类的MMD解析项目，`https://github.com/sselecirPyM/Godot-MMD.git`（我已经下载到本地路径），不过它是`C#`实现的。
+
+参考它的代码，用gdscript让模型里面也可以有ShapeKey支持。

@@ -1,8 +1,27 @@
 class_name PMXImporter extends EditorSceneFormatImporter
 
+## Imports a PMX model as a scene with a [Skeleton3D], one skinned mesh per
+## material and, when the file has vertex morphs (表情), a "Morph" mesh whose
+## [ArrayMesh] holds one blend shape per morph.
+##
+## The morph mesh only contains the triangles the morphs touch, and the blend
+## shapes store absolute vertex positions (like the glTF morph targets), so
+## driving them costs the face vertices only:
+## [codeblock]
+## var face: MeshInstance3D = $Model/Mesh/Morph
+## var smile := face.mesh.find_blend_shape_by_name("笑い")
+## face.set_blend_shape_value(smile, 1.0)
+## [/codeblock]
+##
+## The other morph types (UV, bone, material, group) are not converted.
+##
 ## Skeleton3D metadata consumed by MMDPoseSolver and MMDPoseBaker.
 const BONE_DATA_META := "mmd_bone_data"
 const SOLVER_NODE_NAME := "MMDPoseSolver"
+
+## Node holding the surfaces deformed by the vertex morphs (表情). Its
+## [ArrayMesh] carries one blend shape per Position morph of the PMX file.
+const MORPH_NODE_NAME := "Morph"
 
 ## Adds the runtime [MMDPoseSolver] node that applies 付与 (append) to motions
 ## that do not contain it yet. Imported VMD motions are baked by [MMDPoseBaker]
@@ -35,6 +54,15 @@ func pmx_transform_to_godot(pmx):
 	for b in pmx.m_bones:
 		b.m_position.z *= -1
 		b.m_positionOffset.z *= -1
+	# Morph offsets live in the same space as the vertices, so the axis mirror
+	# has to be applied to them as well. Mirroring is improper, which turns the
+	# rotation axis of a bone morph into a pseudovector: (x, y, z) -> (-x, -y, z).
+	for morph in pmx.m_morphs:
+		for position in morph.m_positionMorph:
+			position.m_position.z *= -1
+		for bone in morph.m_boneMorph:
+			bone.m_position.z *= -1
+			bone.m_quaternion = Quaternion(-bone.m_quaternion.x, -bone.m_quaternion.y, bone.m_quaternion.z, bone.m_quaternion.w)
 	pass
 
 
@@ -123,16 +151,50 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solv
 		weights.append(vertex.m_boneWeight2)
 		weights.append(vertex.m_boneWeight3)
 	
+	# Vertex morphs (表情) become blend shapes on a dedicated mesh, the way MMD
+	# uses them: the morph moves vertices, so only the triangles it touches have
+	# to be part of that mesh. The remaining triangles stay in the plain meshes.
+	var morphs := _collect_vertex_morphs(pmx)
+	var morph_vertices := _collect_morph_vertices(morphs)
+	var morph_mesh := ImporterMesh.new()
+	if not morphs.is_empty():
+		for morph in morphs:
+			morph_mesh.add_blend_shape(morph.m_name)
+		# NORMALIZED stores absolute vertex positions, the same convention the
+		# glTF importer uses for its morph targets (and the default of [Mesh]),
+		# so the shapes stay correct even when the mode is not carried over by
+		# the importer or the resource serializer.
+		morph_mesh.set_blend_shape_mode(Mesh.BLEND_SHAPE_MODE_NORMALIZED)
+	var morph_mesh_used := false
+
 	var faceIndex = 0
 	for material in pmx.m_materials:
 		var indexs = PackedInt32Array()
+		var morph_indexs = PackedInt32Array()
 		var faceNum = material.m_numFaceVertices / 3
 		for i in range(faceIndex, faceIndex+faceNum):
 			var face = pmx.m_faces[i]
-			indexs.append(face.m_vertice0)
-			indexs.append(face.m_vertice1)
-			indexs.append(face.m_vertice2)
+			if _face_uses_morph(face, morph_vertices):
+				morph_indexs.append(face.m_vertice0)
+				morph_indexs.append(face.m_vertice1)
+				morph_indexs.append(face.m_vertice2)
+			else:
+				indexs.append(face.m_vertice0)
+				indexs.append(face.m_vertice1)
+				indexs.append(face.m_vertice2)
 		faceIndex += faceNum
+
+		# PMX stores -1 for materials without a texture.
+		var surface_material: Material = null
+		if textureMap.has(material.m_textureIndex):
+			surface_material = textureMap[material.m_textureIndex]
+
+		if not morph_indexs.is_empty():
+			_add_morph_surface(morph_mesh, pmx.m_vertices, morphs, morph_indexs, surface_material)
+			morph_mesh_used = true
+
+		if indexs.is_empty():
+			continue
 
 		var surfaces: Array = []
 		surfaces.resize(ArrayMesh.ARRAY_MAX)
@@ -143,10 +205,6 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solv
 		surfaces[ArrayMesh.ARRAY_WEIGHTS] = weights
 		surfaces[ArrayMesh.ARRAY_INDEX] = indexs
 		var mesh = ImporterMesh.new()
-		# PMX stores -1 for materials without a texture.
-		var surface_material: Material = null
-		if textureMap.has(material.m_textureIndex):
-			surface_material = textureMap[material.m_textureIndex]
 		mesh.add_surface(Mesh.PRIMITIVE_TRIANGLES, surfaces, [], {}, surface_material)
 		mesh.set_name(material.m_name)
 
@@ -159,7 +217,110 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solv
 		mesh_node.name = material.m_name
 		mesh_node.skeleton_path = mesh_node.get_path_to(bone_node)
 
+	if morph_mesh_used:
+		var morph_node = ImporterMeshInstance3D.new()
+		root_node.add_child(morph_node, true)
+		morph_node.set_owner(root_node.get_owner())
+		morph_node.mesh = morph_mesh
+		morph_node.skin = skin
+		morph_node.name = MORPH_NODE_NAME
+		morph_node.skeleton_path = morph_node.get_path_to(bone_node)
+		# The morph mesh is built after the material meshes, but it has to come
+		# first: the node order is the draw order, and the face (the part the
+		# morphs move) should be drawn with the same priority as before.
+		root_node.move_child(morph_node, 0)
+
 	return scene
+
+
+## Returns the vertex (Position) morphs of the model, in file order. They are the
+## ones Godot can drive as blend shapes; the other morph types (UV, bone,
+## material, group) are not converted.
+func _collect_vertex_morphs(pmx: PMXFile) -> Array:
+	var morphs: Array = []
+	for morph in pmx.m_morphs:
+		if morph.m_morphType == PMXFile.PMXMorphType.Position and not morph.m_positionMorph.is_empty():
+			morphs.append(morph)
+	return morphs
+
+
+## Returns the set of vertices moved by any of [param morphs].
+func _collect_morph_vertices(morphs: Array) -> Dictionary:
+	var indices := {}
+	for morph in morphs:
+		for position in morph.m_positionMorph:
+			indices[position.m_vertexIndex] = true
+	return indices
+
+
+func _face_uses_morph(face: PMXFile.PMXFace, morph_vertices: Dictionary) -> bool:
+	if morph_vertices.is_empty():
+		return false
+	return morph_vertices.has(face.m_vertice0) or morph_vertices.has(face.m_vertice1) or morph_vertices.has(face.m_vertice2)
+
+
+## Adds one surface of the morph mesh. Only the vertices used by [param indexs]
+## are written, and every vertex morph becomes a blend shape of absolute vertex
+## positions, so [method MeshInstance3D.set_blend_shape_value] deforms the mesh
+## exactly like the MMD morph does.
+func _add_morph_surface(mesh: ImporterMesh, vertices: Array, morphs: Array, indexs: PackedInt32Array, material: Material) -> void:
+	var remap := {}
+	var order: Array[int] = []
+	for index in indexs:
+		if not remap.has(index):
+			remap[index] = order.size()
+			order.append(index)
+
+	var positions := PackedVector3Array()
+	var normals := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var bones := PackedInt32Array()
+	var weights := PackedFloat32Array()
+	for index in order:
+		var vertex: PMXFile.PMXVertex = vertices[index]
+		positions.append(vertex.m_position)
+		normals.append(vertex.m_normal)
+		uvs.append(vertex.m_uv)
+		bones.append(vertex.m_boneId0)
+		bones.append(vertex.m_boneId1)
+		bones.append(vertex.m_boneId2)
+		bones.append(vertex.m_boneId3)
+		weights.append(vertex.m_boneWeight0)
+		weights.append(vertex.m_boneWeight1)
+		weights.append(vertex.m_boneWeight2)
+		weights.append(vertex.m_boneWeight3)
+
+	var remapped := PackedInt32Array()
+	for index in indexs:
+		remapped.append(remap[index])
+
+	# The blend shape holds absolute positions (BLEND_SHAPE_MODE_NORMALIZED):
+	# the PMX morph stores an offset, so it is added to the base vertex. Every
+	# other vertex keeps its base position; with zeroed entries the whole surface
+	# would collapse towards the morph offsets instead. MMD vertex morphs do not
+	# change the normals, so the base normals are repeated.
+	var blend_shapes: Array[Array] = []
+	for morph in morphs:
+		var targets := positions.duplicate()
+		for position in morph.m_positionMorph:
+			var target: int = remap.get(position.m_vertexIndex, -1)
+			if target >= 0:
+				targets[target] = positions[target] + position.m_position
+		var shape: Array = []
+		shape.resize(ArrayMesh.ARRAY_MAX)
+		shape[ArrayMesh.ARRAY_VERTEX] = targets
+		shape[ArrayMesh.ARRAY_NORMAL] = normals
+		blend_shapes.append(shape)
+
+	var surfaces: Array = []
+	surfaces.resize(ArrayMesh.ARRAY_MAX)
+	surfaces[ArrayMesh.ARRAY_VERTEX] = positions
+	surfaces[ArrayMesh.ARRAY_NORMAL] = normals
+	surfaces[ArrayMesh.ARRAY_TEX_UV] = uvs
+	surfaces[ArrayMesh.ARRAY_BONES] = bones
+	surfaces[ArrayMesh.ARRAY_WEIGHTS] = weights
+	surfaces[ArrayMesh.ARRAY_INDEX] = remapped
+	mesh.add_surface(Mesh.PRIMITIVE_TRIANGLES, surfaces, blend_shapes, {}, material)
 
 
 ## Stores the bone rules in the skeleton metadata and, unless the project works
