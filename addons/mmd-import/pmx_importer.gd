@@ -122,13 +122,18 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solv
 			parent = pmx.m_bones[bone.m_parentBoneIndex]
 			position = bone.m_position - parent.m_position
 			bone_node.set_bone_parent(i, bone.m_parentBoneIndex)
-			bone_node.set_bone_pose_position(i, position)
 		else:
 			position = bone.m_position
+		# The pose has to start on the rest pose, the root bones included: the
+		# skin binds the mesh with the rest transform, so a root bone whose pose
+		# is left at the origin would draw the whole model that far away, and the
+		# physics offsets (built from the rest poses) would not match the bones
+		# they move.
 		bone_node.set_bone_rest(i, Transform3D(Basis.IDENTITY, position))
+		bone_node.set_bone_pose_position(i, position)
 
 	_create_pose_solver(pmx, bone_node, scene, runtime_solver)
-	_create_physics(pmx, bone_node, scene, physics)
+	_create_physics(pmx, bone_node, scene, physics, scale)
 
 	# Create Skin
 	for bone in pmx.m_bones:
@@ -420,10 +425,10 @@ func _build_bone_data(pmx: PMXFile) -> Array:
 ## adds the runtime [MMDPhysicsSimulator] that drives them, unless the physics is
 ## disabled in the import dock. The bodies are what makes hair, skirts and breasts
 ## move: they are simulated and the result is written back into the bones.
-func _create_physics(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, enabled: bool) -> void:
+func _create_physics(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, enabled: bool, scale: float) -> void:
 	if not enabled or pmx.m_rigidbodies.is_empty():
 		return
-	var data := _build_physics_data(pmx)
+	var data := _build_physics_data(pmx, scale)
 	if data["rigid_bodies"].is_empty():
 		return
 	bone_node.set_meta(PHYSICS_DATA_META, data)
@@ -438,7 +443,11 @@ func _create_physics(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, enabled
 ## Collects the rigid bodies (剛体) and the joints (ジョイント) of the file.
 ## Transforms are converted to Godot space (scaled by the importer, mirrored like
 ## the mesh), so the runtime node only has to place them.
-func _build_physics_data(pmx: PMXFile) -> Dictionary:
+##
+## The scale the model was imported with is stored with them: the simulator needs
+## it to convert the gravity and the angular springs of MMD, which are given in
+## the units of the file, to the units of the scene.
+func _build_physics_data(pmx: PMXFile, scale: float) -> Dictionary:
 	var bone_count := pmx.m_bones.size()
 	var rigid_bodies: Array = []
 	for rigid_body in pmx.m_rigidbodies:
@@ -482,7 +491,7 @@ func _build_physics_data(pmx: PMXFile) -> Dictionary:
 			"angular_max": Vector3(-joint.m_rotateLowerLimit.x, -joint.m_rotateLowerLimit.y, joint.m_rotateUpperLimit.z),
 			"angular_spring": joint.m_springRotateFactor,
 		})
-	return {"rigid_bodies": rigid_bodies, "joints": joints}
+	return {"rigid_bodies": rigid_bodies, "joints": joints, "scale": scale}
 
 
 ## Converts a transform of the PMX file to a Godot [Transform3D].

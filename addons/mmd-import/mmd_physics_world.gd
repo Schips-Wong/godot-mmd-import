@@ -63,6 +63,13 @@ var angular_spring_scale := 1.0
 var spring_damping := 0.5
 ## Gravity of the space, in the units of the imported model.
 var gravity := 9.8
+## Length scale of the model relative to the units of the PMX file (the importer
+## uses 0.1). MMD runs Bullet in the units of the file, so a value that carries a
+## length has to follow the scale of the model: the stiffness of an angular
+## spring is a torque per radian, a torque scales with a length squared, so the
+## angular springs are converted with the square of this value. Linear springs
+## and damping have no length dimension and are used as they are.
+var physics_scale := 1.0
 
 var _space := RID()
 var _bodies: Array[RID] = []
@@ -185,8 +192,11 @@ func add_joint(data: Dictionary) -> int:
 	# joint stays valid when the whole model moves.
 	PhysicsServer3D.joint_make_generic_6dof(joint, _bodies[body_a], _local_frame(body_a, frame), _bodies[body_b], _local_frame(body_b, frame))
 	_configure_joint(joint, data)
-	# MMD keeps the collisions of two jointed bodies enabled.
-	PhysicsServer3D.joint_disable_collisions_between_bodies(joint, false)
+	# A chain of bodies overlaps its neighbour at every joint on purpose, so the
+	# pair a joint holds together must not collide with itself: the solver would
+	# spend every step pushing the two halves of the joint apart. This is how a 6
+	# DOF chain is built in Bullet (disableCollisionsBetweenLinkedBodies).
+	PhysicsServer3D.joint_disable_collisions_between_bodies(joint, true)
 	_joints.append(joint)
 	return index
 
@@ -207,6 +217,29 @@ func set_body_transform(index: int, transform: Transform3D) -> void:
 		return
 	_transforms[index] = transform
 	PhysicsServer3D.body_set_state(_bodies[index], PhysicsServer3D.BODY_STATE_TRANSFORM, transform)
+
+
+## Moves every body by [param delta], velocities included: the world of the
+## model is the space of the scene, so the bodies have to follow when the node
+## of the model moves. The joint frames are stored in the local space of the
+## bodies, so they stay valid.
+func translate_bodies(delta: Transform3D) -> void:
+	if not _open:
+		return
+	for index in range(_bodies.size()):
+		var body: RID = _bodies[index]
+		var moved: Transform3D = delta * PhysicsServer3D.body_get_state(body, PhysicsServer3D.BODY_STATE_TRANSFORM)
+		PhysicsServer3D.body_set_state(body, PhysicsServer3D.BODY_STATE_TRANSFORM, moved)
+		if _dynamic[index]:
+			var linear: Vector3 = PhysicsServer3D.body_get_state(body, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY)
+			var angular: Vector3 = PhysicsServer3D.body_get_state(body, PhysicsServer3D.BODY_STATE_ANGULAR_VELOCITY)
+			PhysicsServer3D.body_set_state(body, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, delta.basis * linear)
+			PhysicsServer3D.body_set_state(body, PhysicsServer3D.BODY_STATE_ANGULAR_VELOCITY, delta.basis * angular)
+		else:
+			# The kinematic bodies are placed from their bone again next frame;
+			# keeping the last written transform in sync keeps the joint frames
+			# meaningful if one is ever added to the world after this call.
+			_transforms[index] = moved
 
 
 ## Stops the body and removes the rotation it gathered until now.
@@ -249,16 +282,26 @@ func _configure_joint(joint: RID, data: Dictionary) -> void:
 	var angular_max: Vector3 = data.get("angular_max", Vector3.ZERO)
 	var angular_spring: Vector3 = data.get("angular_spring", Vector3.ZERO)
 
+	# A joint of the file can store a lower limit above its upper one, which is
+	# an authoring mistake MMD survives by clamping somewhere inside the range.
+	# The solvers of Godot read that as an invalid interval and drop the limit
+	# altogether (the axis becomes free), so the ends are sorted here: losing the
+	# limit is the one outcome no model wants.
+	var linear_low := Vector3(minf(linear_min.x, linear_max.x), minf(linear_min.y, linear_max.y), minf(linear_min.z, linear_max.z))
+	var linear_high := Vector3(maxf(linear_min.x, linear_max.x), maxf(linear_min.y, linear_max.y), maxf(linear_min.z, linear_max.z))
+	var angular_low := Vector3(minf(angular_min.x, angular_max.x), minf(angular_min.y, angular_max.y), minf(angular_min.z, angular_max.z))
+	var angular_high := Vector3(maxf(angular_min.x, angular_max.x), maxf(angular_min.y, angular_max.y), maxf(angular_min.z, angular_max.z))
+
 	for axis in range(3):
 		PhysicsServer3D.generic_6dof_joint_set_flag(joint, axis, PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT, true)
-		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_LOWER_LIMIT, linear_min[axis])
-		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_UPPER_LIMIT, linear_max[axis])
+		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_LOWER_LIMIT, linear_low[axis])
+		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_UPPER_LIMIT, linear_high[axis])
 		PhysicsServer3D.generic_6dof_joint_set_flag(joint, axis, PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_ANGULAR_LIMIT, true)
-		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_LOWER_LIMIT, angular_min[axis])
-		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_UPPER_LIMIT, angular_max[axis])
+		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_LOWER_LIMIT, angular_low[axis])
+		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_UPPER_LIMIT, angular_high[axis])
 
 		_set_spring(joint, axis, linear_spring[axis] * linear_spring_scale, true)
-		_set_spring(joint, axis, angular_spring[axis] * angular_spring_scale, false)
+		_set_spring(joint, axis, angular_spring[axis] * angular_spring_scale * physics_scale * physics_scale, false)
 
 
 ## Enables the spring of one axis when it has a stiffness. A zero stiffness is
