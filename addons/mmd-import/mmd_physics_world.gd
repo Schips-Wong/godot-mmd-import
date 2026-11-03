@@ -70,6 +70,17 @@ var gravity := 9.8
 ## angular springs are converted with the square of this value. Linear springs
 ## and damping have no length dimension and are used as they are.
 var physics_scale := 1.0
+## Multiplier of the support spring, 0 turns it off.
+var support_spring_scale := 1.0
+## Sum of the angular limits, in radians, below which a joint without a spring
+## counts as "hold this part in place" and gets the support spring.
+const LIMIT_SPRING_RANGE := 0.6
+## Stiffness and damping of that support spring, in the units of the PMX file
+## (scaled with the model like every other torque, see [member physics_scale]).
+## A stiff spring needs a lot of damping: a light spring on a long feather is
+## under damped and feeds the wobble it is there to stop.
+const LIMIT_SPRING_STIFFNESS := 100000.0
+const LIMIT_SPRING_DAMPING := 10000.0
 
 var _space := RID()
 var _bodies: Array[RID] = []
@@ -292,6 +303,14 @@ func _configure_joint(joint: RID, data: Dictionary) -> void:
 	var angular_low := Vector3(minf(angular_min.x, angular_max.x), minf(angular_min.y, angular_max.y), minf(angular_min.z, angular_max.z))
 	var angular_high := Vector3(maxf(angular_min.x, angular_max.x), maxf(angular_min.y, angular_max.y), maxf(angular_min.z, angular_max.z))
 
+	# A narrow angular limit without a spring is a joint the author wants to stay
+	# where it is. A limit alone is not enough: a limit can only push back once the
+	# joint is already out, and with a chain hanging on it the solver can leave it
+	# out by tens of degrees. A spring on the same axis pulls the joint to the pose
+	# of the file instead, which is what keeps a wing of small limits together.
+	var support := support_spring_scale > 0.0 and angular_spring.is_zero_approx() and (angular_high - angular_low).length() < LIMIT_SPRING_RANGE
+	var area := physics_scale * physics_scale * support_spring_scale
+
 	for axis in range(3):
 		PhysicsServer3D.generic_6dof_joint_set_flag(joint, axis, PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT, true)
 		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_LOWER_LIMIT, linear_low[axis])
@@ -301,12 +320,16 @@ func _configure_joint(joint: RID, data: Dictionary) -> void:
 		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_UPPER_LIMIT, angular_high[axis])
 
 		_set_spring(joint, axis, linear_spring[axis] * linear_spring_scale, true)
-		_set_spring(joint, axis, angular_spring[axis] * angular_spring_scale * physics_scale * physics_scale, false)
+		if support:
+			_set_spring(joint, axis, LIMIT_SPRING_STIFFNESS * area, false, LIMIT_SPRING_DAMPING * area)
+		else:
+			_set_spring(joint, axis, angular_spring[axis] * angular_spring_scale * physics_scale * physics_scale, false)
 
 
 ## Enables the spring of one axis when it has a stiffness. A zero stiffness is
-## how the PMX file says "no spring on this axis".
-func _set_spring(joint: RID, axis: int, stiffness: float, linear: bool) -> void:
+## how the PMX file says "no spring on this axis". [param damping] overrides
+## [member spring_damping] for the springs the importer adds itself.
+func _set_spring(joint: RID, axis: int, stiffness: float, linear: bool, damping := -1.0) -> void:
 	var flag := PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING if linear else PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING
 	var stiffness_param := PhysicsServer3D.G6DOF_JOINT_LINEAR_SPRING_STIFFNESS if linear else PhysicsServer3D.G6DOF_JOINT_ANGULAR_SPRING_STIFFNESS
 	var damping_param := PhysicsServer3D.G6DOF_JOINT_LINEAR_SPRING_DAMPING if linear else PhysicsServer3D.G6DOF_JOINT_ANGULAR_SPRING_DAMPING
@@ -316,7 +339,7 @@ func _set_spring(joint: RID, axis: int, stiffness: float, linear: bool) -> void:
 		return
 	PhysicsServer3D.generic_6dof_joint_set_flag(joint, axis, flag, true)
 	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, stiffness_param, absf(stiffness))
-	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, damping_param, spring_damping)
+	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, damping_param, spring_damping if damping < 0.0 else damping)
 	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, equilibrium_param, 0.0)
 
 

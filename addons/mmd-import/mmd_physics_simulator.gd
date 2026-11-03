@@ -67,6 +67,11 @@ const ALIGN_FRAMES := 4
 @export_range(0.0, 100.0, 0.01) var angular_spring_scale := 1.0
 ## Damping ratio of every joint spring (Bullet, the engine of MMD, uses 0.5).
 @export_range(0.0, 1.0, 0.01) var spring_damping := 0.75
+## Multiplier of the spring that holds the joints of small limits together, 0
+## turns it off. A joint of the file that allows only a few degrees and has no
+## spring of its own is meant to keep its part in place; the limit alone cannot,
+## see [method MMDPhysicsWorld._configure_joint].
+@export_range(0.0, 4.0, 0.05) var support_spring_scale := 1.0
 
 ## Length scale of the model relative to the units of the PMX file. The importer
 ## writes the scale it used in the physics metadata; a model that keeps the
@@ -198,6 +203,7 @@ func _build(skeleton: Skeleton3D) -> void:
 	_world.linear_spring_scale = linear_spring_scale
 	_world.angular_spring_scale = angular_spring_scale
 	_world.spring_damping = spring_damping
+	_world.support_spring_scale = support_spring_scale
 	_world.open(world_gravity)
 
 	# The metadata is in the space of the skeleton, the physics runs in the
