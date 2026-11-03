@@ -52,6 +52,14 @@ const TELEPORT_ANGLE := 45.0
 ## Number of modifications after the world is built for which the bodies are
 ## placed on the pose of the scene again, see [method reset].
 const ALIGN_FRAMES := 4
+## Distance, in the units of the scene, a body may travel away from its bone
+## before it is read as lost and put back. A chain of hair or a skirt swings well
+## inside of it; a body the solver threw out is hundreds of units away.
+const MAX_DRIFT := 3.0
+## Speed, in units per second, and spin, in radians per second, a body on its way
+## out is held to. Hair and skirts of a model stay far below.
+const MAX_SPEED := 20.0
+const MAX_SPIN := 40.0
 
 ## Gravity of the model, in the units of the PMX file: MMD uses 9.8 there, which
 ## is why its hair and its skirts are tuned for a scale of 0.1. The value is
@@ -100,6 +108,8 @@ var _last_root := Transform3D.IDENTITY
 ## Number of modifications left to place the bodies on the pose of the scene
 ## (see [method reset]).
 var _align_frames := 0
+## Bodies put back on their bone, for tuning and for tests.
+var _resets := 0
 
 func _process_modification() -> void:
 	# The editor does not step the PhysicsServer3D: simulating there would only
@@ -204,6 +214,9 @@ func _build(skeleton: Skeleton3D) -> void:
 	_world.angular_spring_scale = angular_spring_scale
 	_world.spring_damping = spring_damping
 	_world.support_spring_scale = support_spring_scale
+	# The masks of the file are not symmetrical, and Godot reads them as an "or":
+	# the pairs are reduced to the ones MMD has, see build_group_rules.
+	_world.group_rules = MMDPhysicsWorld.build_group_rules(bodies)
 	_world.open(world_gravity)
 
 	# The metadata is in the space of the skeleton, the physics runs in the
@@ -357,10 +370,26 @@ func _follow_root(skeleton: Skeleton3D, to_world: Transform3D) -> void:
 ## [method _global_pose] resolves once per frame.
 func _apply_dynamic(skeleton: Skeleton3D, to_skeleton: Transform3D) -> void:
 	var written := {}
+	var to_world := to_skeleton.affine_inverse()
 	for index in _dynamic:
 		var bone: int = _bones[index]
 		var body := to_skeleton * _world.get_body_transform(index)
 		var bone_global := _offsets[index].affine_inverse() * body
+		# A body of the file can be a few centimeter big and weigh ten kilos, and a
+		# contact it should not have pushes it away for good; once it is that far
+		# from its bone the model is lost anyway, so it is put back on the pose the
+		# animation gives the bone. Normal hair and skirt motion stays well inside.
+		var animated := _global_pose(skeleton, bone)
+		var drift := bone_global.origin.distance_to(animated.origin)
+		if drift > MAX_DRIFT:
+			_world.set_body_transform(index, to_world * (_offsets[index] * animated))
+			_world.reset_body_velocity(index)
+			bone_global = animated
+			_resets += 1
+		elif drift > MAX_DRIFT * 0.5:
+			# Already on its way out: brake before it leaves, so the pose is held
+			# instead of being put back in one visible jump.
+			_world.clamp_body_velocity(index, MAX_SPEED, MAX_SPIN)
 		# A body that escaped the simulation (huge impulse, degenerate shape)
 		# would otherwise write NaN into the pose and break the whole model.
 		if not bone_global.origin.is_finite() or not _is_finite(bone_global.basis):
