@@ -861,6 +861,11 @@ func scale(s: float):
 		pass
 	for v in m_bones:
 		v.m_position *= s
+	# Spring factors of the joints are stiffness values, they do not scale with
+	# the length (the same way MMD keeps them).
+	for v in m_rigidbodies:
+		v.m_translate *= s
+		v.m_shapeSize *= s
 	for v in m_joints:
 		v.m_position *= s
 		v.m_positionLowerLimit *= s

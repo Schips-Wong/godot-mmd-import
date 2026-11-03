@@ -15,9 +15,21 @@ class_name PMXImporter extends EditorSceneFormatImporter
 ##
 ## The other morph types (UV, bone, material, group) are not converted.
 ##
+## The rigid bodies (剛体) and joints (ジョイント) become a [MMDPhysicsSimulator]
+## node plus the "mmd_physics_data" metadata: they are what moves the hair, the
+## skirt and the accessories at runtime.
+##
 ## Skeleton3D metadata consumed by MMDPoseSolver and MMDPoseBaker.
 const BONE_DATA_META := "mmd_bone_data"
 const SOLVER_NODE_NAME := "MMDPoseSolver"
+
+## Skeleton3D metadata consumed by [MMDPhysicsSimulator]: the rigid bodies
+## (剛体) and joints (ジョイント) of the file, scaled and mirrored like the mesh.
+const PHYSICS_DATA_META := "mmd_physics_data"
+const PHYSICS_NODE_NAME := "MMDPhysics"
+
+## The influence value of the physics bones.
+const PHYSICS_INFLUENCE_VALUE := 0.25
 
 ## Node holding the surfaces deformed by the vertex morphs (表情). Its
 ## [ArrayMesh] carries one blend shape per Position morph of the PMX file.
@@ -30,12 +42,18 @@ const MORPH_NODE_NAME := "Morph"
 ## metadata is written either way.
 const OPTION_RUNTIME_SOLVER := "mmd/runtime_pose_solver"
 
+## Adds the runtime [MMDPhysicsSimulator] node that simulates the rigid bodies
+## and joints of the file (hair, skirt, breasts...). Without it the metadata is
+## still written, so the node can be added by hand later.
+const OPTION_PHYSICS := "mmd/physics"
+
 
 func _get_extensions() -> PackedStringArray:
 	return PackedStringArray(["pmx"])
 
 func _get_import_options(_path: String) -> void:
 	add_import_option(OPTION_RUNTIME_SOLVER, true)
+	add_import_option(OPTION_PHYSICS, true)
 
 
 func _import_scene(path: String, _flags: int, options: Dictionary) -> Object:
@@ -44,7 +62,8 @@ func _import_scene(path: String, _flags: int, options: Dictionary) -> Object:
 	pmx.scale(0.1)
 	pmx_transform_to_godot(pmx)
 	var runtime_solver := bool(options.get(OPTION_RUNTIME_SOLVER, true))
-	return create_mesh_node(pmx, 0.1, path.get_base_dir(), runtime_solver)
+	var physics := bool(options.get(OPTION_PHYSICS, true))
+	return create_mesh_node(pmx, 0.1, path.get_base_dir(), runtime_solver, physics)
 
 
 func pmx_transform_to_godot(pmx):
@@ -66,7 +85,7 @@ func pmx_transform_to_godot(pmx):
 	pass
 
 
-func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solver: bool = true) -> Object:
+func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solver: bool = true, physics: bool = true) -> Object:
 	var scene = Node3D.new()
 	var root_node = Node3D.new()
 	var bone_node = Skeleton3D.new()
@@ -109,6 +128,7 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solv
 		bone_node.set_bone_rest(i, Transform3D(Basis.IDENTITY, position))
 
 	_create_pose_solver(pmx, bone_node, scene, runtime_solver)
+	_create_physics(pmx, bone_node, scene, physics)
 
 	# Create Skin
 	for bone in pmx.m_bones:
@@ -394,3 +414,83 @@ func _build_bone_data(pmx: PMXFile) -> Array:
 		if has_append or has_ik:
 			data.append(entry)
 	return data
+
+
+## Stores the rigid bodies and joints of the file in the skeleton metadata and
+## adds the runtime [MMDPhysicsSimulator] that drives them, unless the physics is
+## disabled in the import dock. The bodies are what makes hair, skirts and breasts
+## move: they are simulated and the result is written back into the bones.
+func _create_physics(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, enabled: bool) -> void:
+	if not enabled or pmx.m_rigidbodies.is_empty():
+		return
+	var data := _build_physics_data(pmx)
+	if data["rigid_bodies"].is_empty():
+		return
+	bone_node.set_meta(PHYSICS_DATA_META, data)
+	var simulator := MMDPhysicsSimulator.new()
+	simulator.name = PHYSICS_NODE_NAME
+	simulator.set_influence(PHYSICS_INFLUENCE_VALUE)
+	bone_node.add_child(simulator)
+	simulator.set_owner(scene)
+	print("MMD: %d rigid bodies, %d joints" % [data["rigid_bodies"].size(), data["joints"].size()])
+
+
+## Collects the rigid bodies (剛体) and the joints (ジョイント) of the file.
+## Transforms are converted to Godot space (scaled by the importer, mirrored like
+## the mesh), so the runtime node only has to place them.
+func _build_physics_data(pmx: PMXFile) -> Dictionary:
+	var bone_count := pmx.m_bones.size()
+	var rigid_bodies: Array = []
+	for rigid_body in pmx.m_rigidbodies:
+		var bone: int = rigid_body.m_boneIndex
+		if bone < 0 or bone >= bone_count:
+			bone = -1
+		rigid_bodies.append({
+			"name": rigid_body.m_name,
+			"bone": bone,
+			"group": rigid_body.m_group,
+			"mask": rigid_body.m_collisionGroup,
+			"shape": rigid_body.m_shape,
+			"size": rigid_body.m_shapeSize,
+			"transform": mmd_transform(rigid_body.m_translate, rigid_body.m_rotate),
+			"mass": rigid_body.m_mass,
+			"linear_damp": rigid_body.m_translateDimmer,
+			"angular_damp": rigid_body.m_rotateDimmer,
+			"friction": rigid_body.m_friction,
+			"restitution": rigid_body.m_repulsion,
+			"mode": rigid_body.m_op,
+		})
+
+	var joints: Array = []
+	for joint in pmx.m_joints:
+		var body_a: int = joint.m_rigidbodyAIndex
+		var body_b: int = joint.m_rigidbodyBIndex
+		if body_a < 0 or body_b < 0 or body_a >= rigid_bodies.size() or body_b >= rigid_bodies.size():
+			push_warning("MMD: joint '%s' references a missing rigid body, skipped" % joint.m_name)
+			continue
+		joints.append({
+			"name": joint.m_name,
+			"body_a": body_a,
+			"body_b": body_b,
+			"transform": mmd_transform(joint.m_position, joint.m_rotate),
+			# The limits are given in the frame of the joint, which is mirrored
+			# with the model: the X and Y intervals flip (see _build_bone_data).
+			"linear_min": joint.m_positionLowerLimit,
+			"linear_max": joint.m_positionUpperLimit,
+			"linear_spring": joint.m_springTranslateFactor,
+			"angular_min": Vector3(-joint.m_rotateUpperLimit.x, -joint.m_rotateUpperLimit.y, joint.m_rotateLowerLimit.z),
+			"angular_max": Vector3(-joint.m_rotateLowerLimit.x, -joint.m_rotateLowerLimit.y, joint.m_rotateUpperLimit.z),
+			"angular_spring": joint.m_springRotateFactor,
+		})
+	return {"rigid_bodies": rigid_bodies, "joints": joints}
+
+
+## Converts a transform of the PMX file to a Godot [Transform3D].
+##
+## PMX positions and rotations live in MMD space; the importer mirrors the model
+## along Z like the vertex positions, so the basis is conjugated by the mirror.
+## For the YXZ euler angles of the file that is the same as negating X and Y,
+## which also turns a rotation axis into a pseudovector (x, y, z) -> (-x, -y, z).
+static func mmd_transform(position: Vector3, rotation: Vector3) -> Transform3D:
+	var euler := Vector3(-rotation.x, -rotation.y, rotation.z)
+	return Transform3D(Basis.from_euler(euler, EULER_ORDER_YXZ), Vector3(position.x, position.y, -position.z))

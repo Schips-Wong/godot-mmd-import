@@ -8,8 +8,8 @@ About Godot MMD Plugin with gdscript
 - [x] Generate Godot Skin
 - [x] Generate Godot Mesh
 - [x] Generate Godot Morph (vertex morphs as blend shapes)
-- [ ] Generate Godot Rigidbody
-- [ ] Generate Godot Joint
+- [x] Generate Godot Rigidbody (MMDPhysicsSimulator + mmd_physics_data)
+- [x] Generate Godot Joint (Generic6DOF, limits and springs of the PMX file)
 - [ ] Generate Godot Softbody
 - [x] Parse VMD File
 - [x] Generate Godot Animation (bone)
