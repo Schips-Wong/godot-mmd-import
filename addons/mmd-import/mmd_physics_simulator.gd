@@ -394,27 +394,23 @@ func _apply_dynamic(skeleton: Skeleton3D, to_skeleton: Transform3D) -> void:
 		# would otherwise write NaN into the pose and break the whole model.
 		if not bone_global.origin.is_finite() or not _is_finite(bone_global.basis):
 			continue
-		if _merge[index]:
-			bone_global = _merge_pose(_global_pose(skeleton, bone), bone_global)
 		var parent := skeleton.get_bone_parent(bone)
 		var parent_global := Transform3D.IDENTITY
 		if parent >= 0:
 			parent_global = written[parent] if written.has(parent) else _global_pose(skeleton, parent)
 		var local := parent_global.affine_inverse() * bone_global
+		if _merge[index]:
+			# 物理演算とボーン位置合わせ: the body only supplies the rotation. The
+			# position is the one the animation gives the bone <b>in its parent</b>,
+			# not in the model: keeping the world position would cancel the rotation
+			# of the parent and pin the part in place, which is what a skirt of that
+			# mode looked like.
+			local = Transform3D(local.basis, skeleton.get_bone_pose(bone).origin)
 		if not local.origin.is_finite() or not _is_finite(local.basis):
 			continue
 		skeleton.set_bone_pose_position(bone, local.origin)
 		skeleton.set_bone_pose_rotation(bone, local.basis.get_rotation_quaternion().normalized())
-		written[bone] = bone_global
-
-
-## Combines the simulated body with the pose the animation left on the bone for
-## the "physics and bone position" mode of the PMX file
-## (物理演算とボーン位置合わせ): the body only supplies the rotation, the bone
-## keeps the position the animation gave it. That is how MMD drives the parts
-## that have to follow the motion and the simulation at the same time.
-static func _merge_pose(pose: Transform3D, physics: Transform3D) -> Transform3D:
-	return Transform3D(Basis(physics.basis.get_rotation_quaternion().normalized()), pose.origin)
+		written[bone] = parent_global * local
 
 
 ## Returns the pose of [param bone] in the space of the skeleton, as the
