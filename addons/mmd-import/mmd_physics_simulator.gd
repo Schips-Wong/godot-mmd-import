@@ -27,6 +27,13 @@ class_name MMDPhysicsSimulator extends SkeletonModifier3D
 ## model when it moves; a jump large enough to be a teleport rebuilds them on the
 ## new pose, see [method reset].
 ##
+## [b]Tuning[/b]: the physics of a PMX file is authored for Bullet and is often
+## broken on its own (masses of hundreds of thousands of kilos per cubic unit,
+## joints free to slide, no spring at all); see [MMDPhysicsStrategy] for the
+## switches that repair it and [member preset] for the combinations that work on
+## real models. The preset is layered over the parameters exported below, so a
+## model whose hair was hand tuned keeps its tuning.
+##
 ## The node has to run after [MMDPoseSolver]: the bones moved by 付与 have to be
 ## final before the static bodies are placed. [PMXImporter] adds it in that
 ## order, and like every [SkeletonModifier3D] it runs after the
@@ -66,6 +73,55 @@ const MAX_SPIN := 40.0
 ## converted to the units of the scene with [member physics_scale], so the motion
 ## keeps the timing of MMD whatever scale the model was imported with.
 @export_range(0.0, 98.0, 0.1) var gravity := 9.8
+
+@export_group("优化策略")
+## 一套修好 PMX 文件常见缺陷的开关，见 [MMDPhysicsStrategy]。预设会叠在下面
+## 导出的参数之上，所以已经手工调好的场景（弹簧倍率等）不会因为换策略而丢失；
+## 预设只在它自己有意见的开关上覆盖导出值。选
+## [constant MMDPhysicsStrategy.Preset.CUSTOM] 时只用下面导出的参数。
+##
+## 改完这里（或下面的参数）要重新构建世界才生效，见 [method rebuild]；场景
+## 启动时自然就是新值。
+@export var preset: MMDPhysicsStrategy.Preset = MMDPhysicsStrategy.Preset.CUSTOM
+## 把关节的平移限位锁死在 0（不论文件怎么写）。裙子、头发在文件里常常允许
+## 滑动几毫米到几厘米，解算器会把每一步的误差留在那里，链子就会越来越长。
+@export var lock_joint_translation := false
+## 关闭关节的线位移弹簧。平移锁死之后它已经没有作用，而一个很硬的线弹簧会
+## 和锁死角力。
+@export var disable_linear_spring := false
+## 把刚体的弹性（反弹）全部设为 0，不让碰撞把速度还给链子。
+@export var zero_restitution := false
+## 刚体质量的计算方式，见 [enum MMDPhysicsStrategy.MassMode]。文件里的质量
+## 常常是错的（测试模型里有 3cm 的头发 15 公斤），同一条链上的质量不一致是
+## 抖动和炸开的主要原因。
+@export var mass_mode: MMDPhysicsStrategy.MassMode = MMDPhysicsStrategy.MassMode.FILE
+## [constant MMDPhysicsStrategy.MassMode.UNIFORM] 下每个刚体的质量。
+@export_range(0.001, 100.0, 0.001) var uniform_mass := 1.0
+## [constant MMDPhysicsStrategy.MassMode.DENSITY] 下的密度（kg/场景单位³，
+## 1000 相当于水）。
+@export_range(1.0, 100000.0, 1.0) var mass_density := 1000.0
+## 乘在刚体阻尼（文件值和基础阻尼都算）上的倍率。阻尼是把解算器无法收敛的
+## 抖动变成会停下来的摆动的唯一手段。
+@export_range(0.0, 8.0, 0.01) var damping_scale := 1.0
+## 允许刚体休眠。MMD 是关掉的（骨骼一动，链子必须立刻反应），只有几百个刚体
+## 的模型为了性能才值得打开。
+@export var allow_sleep := false
+## 对模拟刚体开启连续碰撞检测。头发刚体只有几厘米却动得很快，没有它会穿进
+## 不该进的身体里，然后被接触以当前速度弹开。
+@export var continuous_collision := true
+## 每帧的保护：跑离骨骼 3 个场景单位以上的刚体被放回骨骼的位置（速度清零），
+## 已经跑偏一半的刚体被限速到 [constant MAX_SPEED]。关掉它可以省掉每帧的检查，
+## 但一个被甩出链子的刚体就再也回不来了。
+@export var stability_guard := true
+## 所有模拟刚体的速度上限（场景单位/秒），0 表示不限制。
+##
+## 一个无法收敛的接触（文件里互相重叠的碰撞体、远比它代表的部位重的刚体）
+## 会给出一个速度，关节几步之内就把它传遍整条链，链子就飞了。限速要每帧读
+## 一次所有刚体的速度（超限时才写），但能挡住伤害扩散。它治不了太软的关节，
+## 只是不让一颗坏刚体拖垮整个模型。按 0.1 导入的模型，5 左右比较合适。
+@export_range(0.0, 50.0, 0.1) var max_speed := 0.0
+
+@export_group("关节弹簧")
 ## Multiplier of the linear springs of the joints. The stiffness of a PMX joint
 ## is a Bullet parameter; the solvers of Godot weight gravity, mass and
 ## stiffness differently, so a value of 1.0 is a starting point, not a law.
@@ -87,6 +143,8 @@ const MAX_SPIN := 40.0
 var physics_scale := 1.0
 
 var _world: MMDPhysicsWorld = null
+## Tuning the world was built with, see [method _resolve_strategy].
+var _strategy := MMDPhysicsStrategy.new()
 var _bone_count := -1
 ## Bone of every body, -1 when the body only collides.
 var _bones := PackedInt32Array()
@@ -142,6 +200,8 @@ func _process_modification() -> void:
 	_apply_dynamic(skeleton, to_world.affine_inverse())
 	_global_cache.clear()
 	_sync_kinematic(skeleton, to_world)
+	if _strategy.max_speed > 0.0:
+		_world.clamp_speeds(_strategy.max_speed, MAX_SPIN)
 
 
 ## Puts every body back on the pose of its bone and stops it. Call it after
@@ -177,6 +237,46 @@ func find_body_of_bone(bone: int) -> int:
 	return -1
 
 
+## Returns the tuning the world runs with: the preset of the node applied on top
+## of the parameters it exports. Read only, a change needs [method rebuild].
+func get_strategy() -> MMDPhysicsStrategy:
+	return _strategy
+
+
+## Builds the bodies and the joints again, picking up the parameters of the node
+## (the preset and the switches) and the metadata of the skeleton. The pose is
+## kept: the bodies are placed on it, see [method reset]. Call it after changing
+## the tuning while the scene runs.
+func rebuild() -> void:
+	var skeleton := get_skeleton()
+	if skeleton == null:
+		return
+	_global_cache.clear()
+	_build(skeleton)
+
+
+## Returns the tuning to build the world with: the switches of [member preset]
+## applied on top of the parameters of the node.
+func _resolve_strategy() -> MMDPhysicsStrategy:
+	var base := MMDPhysicsStrategy.new()
+	base.lock_translation = lock_joint_translation
+	base.disable_linear_spring = disable_linear_spring
+	base.linear_spring_scale = linear_spring_scale
+	base.angular_spring_scale = angular_spring_scale
+	base.spring_damping = spring_damping
+	base.support_spring_scale = support_spring_scale
+	base.mass_mode = mass_mode
+	base.uniform_mass = uniform_mass
+	base.density = mass_density
+	base.damping_scale = damping_scale
+	base.zero_restitution = zero_restitution
+	base.continuous_collision = continuous_collision
+	base.allow_sleep = allow_sleep
+	base.stability_guard = stability_guard
+	base.max_speed = max_speed
+	return MMDPhysicsStrategy.create(preset, base)
+
+
 func _skeleton_changed(_old_skeleton: Skeleton3D, _new_skeleton: Skeleton3D) -> void:
 	_release()
 	_bone_count = -1
@@ -208,12 +308,10 @@ func _build(skeleton: Skeleton3D) -> void:
 	# hair falls as slowly as in MMD instead of ten times faster on a model
 	# imported at 0.1.
 	var world_gravity := gravity * physics_scale
+	_strategy = _resolve_strategy()
 	_world.gravity = world_gravity
 	_world.physics_scale = physics_scale
-	_world.linear_spring_scale = linear_spring_scale
-	_world.angular_spring_scale = angular_spring_scale
-	_world.spring_damping = spring_damping
-	_world.support_spring_scale = support_spring_scale
+	_world.strategy = _strategy
 	# The masks of the file are not symmetrical, and Godot reads them as an "or":
 	# the pairs are reduced to the ones MMD has, see build_group_rules.
 	_world.group_rules = MMDPhysicsWorld.build_group_rules(bodies)
@@ -251,6 +349,8 @@ func _build(skeleton: Skeleton3D) -> void:
 		var placed: Dictionary = joint.duplicate()
 		placed["transform"] = to_world * (joint.get("transform", Transform3D.IDENTITY) as Transform3D)
 		_world.add_joint(placed)
+
+	print_verbose("MMD: physics %s (%d bodies, %d joints)" % [_strategy.describe(), bodies.size(), joints.size()])
 
 	# The bodies were created on the rest pose of the file, which is not the pose
 	# the model has when the physics starts (a motion that plays, a pose that was
@@ -379,17 +479,18 @@ func _apply_dynamic(skeleton: Skeleton3D, to_skeleton: Transform3D) -> void:
 		# contact it should not have pushes it away for good; once it is that far
 		# from its bone the model is lost anyway, so it is put back on the pose the
 		# animation gives the bone. Normal hair and skirt motion stays well inside.
-		var animated := _global_pose(skeleton, bone)
-		var drift := bone_global.origin.distance_to(animated.origin)
-		if drift > MAX_DRIFT:
-			_world.set_body_transform(index, to_world * (_offsets[index] * animated))
-			_world.reset_body_velocity(index)
-			bone_global = animated
-			_resets += 1
-		elif drift > MAX_DRIFT * 0.5:
-			# Already on its way out: brake before it leaves, so the pose is held
-			# instead of being put back in one visible jump.
-			_world.clamp_body_velocity(index, MAX_SPEED, MAX_SPIN)
+		if _strategy.stability_guard:
+			var animated := _global_pose(skeleton, bone)
+			var drift := bone_global.origin.distance_to(animated.origin)
+			if drift > MAX_DRIFT:
+				_world.set_body_transform(index, to_world * (_offsets[index] * animated))
+				_world.reset_body_velocity(index)
+				bone_global = animated
+				_resets += 1
+			elif drift > MAX_DRIFT * 0.5:
+				# Already on its way out: brake before it leaves, so the pose is
+				# held instead of being put back in one visible jump.
+				_world.clamp_body_velocity(index, MAX_SPEED, MAX_SPIN)
 		# A body that escaped the simulation (huge impulse, degenerate shape)
 		# would otherwise write NaN into the pose and break the whole model.
 		if not bone_global.origin.is_finite() or not _is_finite(bone_global.basis):

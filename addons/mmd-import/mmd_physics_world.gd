@@ -29,6 +29,13 @@ class_name MMDPhysicsWorld extends RefCounted
 ##
 ## [b]Scale[/b]: the data is already scaled and mirrored by the importer, so the
 ## bodies are created in the same space as the bones of the [Skeleton3D].
+##
+## [b]Tuning[/b]: the masses, the damping, the restitution, the swept test, the
+## sleeping and the limits of the joints are all read from [member strategy],
+## see [MMDPhysicsStrategy]. The values of the file alone are rarely usable: the
+## test models of this project carry masses up to three hundred thousand kilos
+## per cubic unit, joints free to slide that should not be, and, in most files,
+## no spring at all.
 
 ## Shape ids, the same order as [enum PMXFile.PMXShape].
 enum Shape {
@@ -63,14 +70,10 @@ var BASE_DAMP := 0.5
 ## PMX files use 16 collision groups.
 const GROUP_COUNT := 16
 
-## Stiffness multiplier applied to the linear springs of the joints, see
-## [member MMDPhysicsSimulator.linear_spring_scale].
-var linear_spring_scale := 1.0
-## Stiffness multiplier applied to the angular springs of the joints.
-var angular_spring_scale := 1.0
-## Damping ratio of every joint spring; Bullet, the engine MMD uses, applies
-## 0.5 by default.
-var spring_damping := 0.5
+## Tuning of the simulation, see [MMDPhysicsStrategy]. It is read while the
+## bodies and the joints are created, so changing it needs the world to be built
+## again ([method MMDPhysicsSimulator.rebuild]).
+var strategy := MMDPhysicsStrategy.new()
 ## Gravity of the space, in the units of the imported model.
 var gravity := 9.8
 ## Length scale of the model relative to the units of the PMX file (the importer
@@ -80,8 +83,6 @@ var gravity := 9.8
 ## angular springs are converted with the square of this value. Linear springs
 ## and damping have no length dimension and are used as they are.
 var physics_scale := 1.0
-## Multiplier of the support spring, 0 turns it off.
-var support_spring_scale := 1.0
 ## Collision mask of every group, worked out by [method build_group_rules]. When
 ## it is set, it replaces the mask each body carries.
 var group_rules := PackedInt32Array()
@@ -229,26 +230,22 @@ func add_rigid_body(data: Dictionary) -> int:
 
 	var shape := int(data.get("shape", Shape.SPHERE))
 	var size: Vector3 = data.get("size", Vector3.ONE)
-	var mass := maxf(float(data.get("mass", 1.0)), MIN_MASS)
-	# Files often give a body a mass that has nothing to do with its size (a lock
-	# of hair of three centimeter weighing fifteen kilos, four hundred times the
-	# density of water). Such a body answers a contact with an impulse no chain
-	# survives, so its mass is cut down to what its volume can reasonably hold.
-	var volume := _volume(shape, size)
-	if volume > 0.0:
-		mass = minf(mass, maxf(volume * MAX_DENSITY, MIN_MASS))
+	var mass := _mass_of(data, shape, size)
 
 	var body := PhysicsServer3D.body_create()
-	PhysicsServer3D.body_set_mode(body, PhysicsServer3D.BODY_MODE_RIGID if dynamic else PhysicsServer3D.BODY_MODE_KINEMATIC)
+	PhysicsServer3D.body_set_mode(body, _body_mode(dynamic, int(data.get("bone", -1))))
 	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_MASS, mass)
 	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_FRICTION, maxf(float(data.get("friction", 0.5)), 0.0))
-	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_BOUNCE, clampf(float(data.get("restitution", 0.0)), 0.0, 1.0))
-	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_LINEAR_DAMP, maxf(float(data.get("linear_damp", 0.0)), BASE_DAMP))
-	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_ANGULAR_DAMP, maxf(float(data.get("angular_damp", 0.0)), BASE_DAMP))
+	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_BOUNCE, _bounce_of(data))
+	var damping := _damping_of(data)
+	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_LINEAR_DAMP, damping.x)
+	PhysicsServer3D.body_set_param(body, PhysicsServer3D.BODY_PARAM_ANGULAR_DAMP, damping.y)
 	# MMD disables deactivation (Bullet: DisableDeactivation, zero sleep
 	# thresholds): a hair or skirt chain has to react the moment the body moves,
-	# not after it woke up again.
-	PhysicsServer3D.body_set_state(body, PhysicsServer3D.BODY_STATE_CAN_SLEEP, false)
+	# not after it woke up again. It is only worth letting a body sleep when the
+	# strategy asks for the cheapest simulation, and then the chain it belongs to
+	# wakes up as a whole, because the bodies are held by joints.
+	PhysicsServer3D.body_set_state(body, PhysicsServer3D.BODY_STATE_CAN_SLEEP, strategy.allow_sleep)
 
 	PhysicsServer3D.body_set_collision_layer(body, 1 << group)
 	PhysicsServer3D.body_set_collision_mask(body, mask)
@@ -256,7 +253,7 @@ func add_rigid_body(data: Dictionary) -> int:
 	# passes through the body it should not enter, and the contact that finally
 	# finds it pushes it away with the speed it had.
 	if dynamic:
-		PhysicsServer3D.body_set_enable_continuous_collision_detection(body, true)
+		PhysicsServer3D.body_set_enable_continuous_collision_detection(body, strategy.continuous_collision)
 	PhysicsServer3D.body_add_shape(body, _shape_for(shape, size))
 	var transform: Transform3D = data.get("transform", Transform3D.IDENTITY)
 	PhysicsServer3D.body_set_state(body, PhysicsServer3D.BODY_STATE_TRANSFORM, transform)
@@ -268,6 +265,61 @@ func add_rigid_body(data: Dictionary) -> int:
 	var extent := maxf(size.x, maxf(size.y, size.z))
 	_inertia.append(mass * extent * extent)
 	return index
+
+
+## Returns the mode the physics server needs for a body.
+##
+## A body the file marks as static is a collider the bones drag around, which is
+## a kinematic body. A static body that belongs to no bone never moves at all, so
+## it is created as a plain static body: the server can skip it in the broad
+## phase, and nothing else in the model can push it away.
+func _body_mode(dynamic: bool, bone: int) -> int:
+	if dynamic:
+		return PhysicsServer3D.BODY_MODE_RIGID
+	return PhysicsServer3D.BODY_MODE_STATIC if bone < 0 else PhysicsServer3D.BODY_MODE_KINEMATIC
+
+
+## Returns the mass of a body, following [member MMDPhysicsStrategy.mass_mode].
+##
+## The masses of a PMX file are usually meaningless: the test models of this
+## project go up to fifteen kilos for a lock of hair of three centimeters, a
+## density of three hundred thousand kilos per cubic unit. A body like that
+## answers the lightest contact with an impulse that no chain of joints
+## survives, and it drags the bodies it is joint to along with it.
+func _mass_of(data: Dictionary, shape: int, size: Vector3) -> float:
+	var volume := volume_of(shape, size)
+	match strategy.mass_mode:
+		MMDPhysicsStrategy.MassMode.UNIFORM:
+			return maxf(strategy.uniform_mass, MIN_MASS)
+		MMDPhysicsStrategy.MassMode.DENSITY:
+			if volume > 0.0:
+				return maxf(volume * strategy.density, MIN_MASS)
+	# The mass of the file, cut down to what the volume can reasonably hold: a
+	# typo of the author is the one thing that must not reach the solver.
+	var mass := maxf(float(data.get("mass", 1.0)), MIN_MASS)
+	if volume > 0.0:
+		mass = minf(mass, maxf(volume * MAX_DENSITY, MIN_MASS))
+	return mass
+
+
+## Returns the restitution of a body, in the units of the physics server.
+func _bounce_of(data: Dictionary) -> float:
+	if strategy.zero_restitution:
+		return 0.0
+	return clampf(float(data.get("restitution", 0.0)), 0.0, 1.0)
+
+
+## Returns the linear and the angular damping of a body, in (x, y).
+##
+## The file gives a damping of 0.5 to 1.0 to almost every body, so what the
+## strategy adds on top is what decides how long a chain keeps swinging. The
+## value of the file is never lowered below [constant BASE_DAMP]: a solver that
+## cannot settle a contact needs the floor.
+func _damping_of(data: Dictionary) -> Vector2:
+	var scale := maxf(strategy.damping_scale, 0.0)
+	return Vector2(
+		maxf(float(data.get("linear_damp", 0.0)), BASE_DAMP) * scale,
+		maxf(float(data.get("angular_damp", 0.0)), BASE_DAMP) * scale)
 
 
 ## Adds the joint described by [param data] and returns its index. A joint that
@@ -357,6 +409,23 @@ func clamp_body_velocity(index: int, max_linear: float, max_angular: float) -> v
 		PhysicsServer3D.body_set_state(body, PhysicsServer3D.BODY_STATE_ANGULAR_VELOCITY, angular.normalized() * max_angular)
 
 
+## Cuts the speed of every simulated body down to [param max_linear] and
+## [param max_spin].
+##
+## A single contact that the solver cannot resolve (a body of the file that
+## overlaps another one, a shape far bigger than the part it stands for) hands
+## out a speed that the joints then spread over the whole model in a few steps. A
+## limit on the speed of the bodies stops that cascade: the part keeps moving,
+## but it cannot leave with a speed the animation never had.
+func clamp_speeds(max_linear: float, max_spin: float) -> void:
+	if not _open:
+		return
+	for index in range(_bodies.size()):
+		if not _dynamic[index]:
+			continue
+		clamp_body_velocity(index, max_linear, max_spin)
+
+
 ## Stops the body and removes the rotation it gathered until now.
 func reset_body_velocity(index: int) -> void:
 	if index < 0 or index >= _bodies.size() or not _dynamic[index]:
@@ -407,15 +476,23 @@ func _configure_joint(joint: RID, data: Dictionary, inertia: float) -> void:
 	var angular_low := Vector3(minf(angular_min.x, angular_max.x), minf(angular_min.y, angular_max.y), minf(angular_min.z, angular_max.z))
 	var angular_high := Vector3(maxf(angular_min.x, angular_max.x), maxf(angular_min.y, angular_max.y), maxf(angular_min.z, angular_max.z))
 
+	# A joint of a hair or a skirt is meant to keep its parts at a fixed distance:
+	# a translation that slides is what lets the chain stretch, step by step,
+	# until the hair hangs below the mesh it belongs to (in the files of the test
+	# folder a third of the joints allow the slide). The strategy pins it.
+	if strategy.lock_translation:
+		linear_low = Vector3.ZERO
+		linear_high = Vector3.ZERO
+
 	# A narrow angular limit without a spring is a joint the author wants to stay
 	# where it is. A limit alone is not enough: a limit can only push back once the
 	# joint is already out, and with a chain hanging on it the solver can leave it
 	# out by tens of degrees. A spring on the same axis pulls the joint to the pose
 	# of the file instead, which is what keeps a wing of small limits together.
-	var support := support_spring_scale > 0.0 and angular_spring.is_zero_approx() and (angular_high - angular_low).length() < LIMIT_SPRING_RANGE
+	var support := strategy.support_spring_scale > 0.0 and angular_spring.is_zero_approx() and (angular_high - angular_low).length() < LIMIT_SPRING_RANGE
 	# A spring that returns a body of inertia I with the wanted frequency and
 	# damping: k = I * w2 and c = 2 * z * I * w.
-	var inertia_scaled := inertia * support_spring_scale
+	var inertia_scaled := inertia * strategy.support_spring_scale
 	var support_stiffness := inertia_scaled * SUPPORT_OMEGA * SUPPORT_OMEGA
 	var support_damping := 2.0 * SUPPORT_ZETA * inertia_scaled * SUPPORT_OMEGA
 
@@ -427,16 +504,20 @@ func _configure_joint(joint: RID, data: Dictionary, inertia: float) -> void:
 		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_LOWER_LIMIT, angular_low[axis])
 		PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, PhysicsServer3D.G6DOF_JOINT_ANGULAR_UPPER_LIMIT, angular_high[axis])
 
-		_set_spring(joint, axis, linear_spring[axis] * linear_spring_scale, true)
+		if strategy.disable_linear_spring:
+			_set_spring(joint, axis, 0.0, true)
+		else:
+			_set_spring(joint, axis, linear_spring[axis] * strategy.linear_spring_scale, true)
 		if support:
 			_set_spring(joint, axis, support_stiffness, false, support_damping)
 		else:
-			_set_spring(joint, axis, angular_spring[axis] * angular_spring_scale * physics_scale * physics_scale, false)
+			_set_spring(joint, axis, angular_spring[axis] * strategy.angular_spring_scale * physics_scale * physics_scale, false)
 
 
 ## Enables the spring of one axis when it has a stiffness. A zero stiffness is
 ## how the PMX file says "no spring on this axis". [param damping] overrides
-## [member spring_damping] for the springs the importer adds itself.
+## [member MMDPhysicsStrategy.spring_damping] for the springs the importer adds
+## itself.
 func _set_spring(joint: RID, axis: int, stiffness: float, linear: bool, damping := -1.0) -> void:
 	var flag := PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_LINEAR_SPRING if linear else PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_ANGULAR_SPRING
 	var stiffness_param := PhysicsServer3D.G6DOF_JOINT_LINEAR_SPRING_STIFFNESS if linear else PhysicsServer3D.G6DOF_JOINT_ANGULAR_SPRING_STIFFNESS
@@ -447,12 +528,12 @@ func _set_spring(joint: RID, axis: int, stiffness: float, linear: bool, damping 
 		return
 	PhysicsServer3D.generic_6dof_joint_set_flag(joint, axis, flag, true)
 	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, stiffness_param, absf(stiffness))
-	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, damping_param, spring_damping if damping < 0.0 else damping)
+	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, damping_param, strategy.spring_damping if damping < 0.0 else damping)
 	PhysicsServer3D.generic_6dof_joint_set_param(joint, axis, equilibrium_param, 0.0)
 
 
 ## Volume of the collision shape, in units of the scene.
-static func _volume(shape: int, size: Vector3) -> float:
+static func volume_of(shape: int, size: Vector3) -> float:
 	match shape:
 		Shape.BOX:
 			return 8.0 * size.x * size.y * size.z

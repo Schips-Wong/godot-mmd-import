@@ -28,7 +28,16 @@ const SOLVER_NODE_NAME := "MMDPoseSolver"
 const PHYSICS_DATA_META := "mmd_physics_data"
 const PHYSICS_NODE_NAME := "MMDPhysics"
 
-## The influence value of the physics bones.
+## The influence value of the physics bones, that is how much of the simulation
+## lands on the pose every frame.
+##
+## [Skeleton3D] blends the result of a modifier with the pose it had before it,
+## so a value below 1.0 turns the physics into a low pass filter: the hair still
+## follows the body, but it no longer snaps to a single step of the simulation.
+## That is what hides the 60 Hz stepping of a chain of joints on a screen that
+## refreshes faster, and what keeps a body the solver cannot settle from shaking
+## the mesh. The cost is lag: at 0.25 a lock of hair needs a few frames to catch
+## up, at 1.0 it is exact and a bit more nervous. Tune it on the node.
 const PHYSICS_INFLUENCE_VALUE := 0.25
 
 ## Node holding the surfaces deformed by the vertex morphs (表情). Its
@@ -48,6 +57,14 @@ const OPTION_RUNTIME_SOLVER := "mmd/runtime_pose_solver"
 ## still written, so the node can be added by hand later.
 const OPTION_PHYSICS := "mmd/physics"
 
+## Optimization strategy the imported [MMDPhysicsSimulator] starts with, one of
+## [enum MMDPhysicsStrategy.Preset]. "Custom" uses the parameters the node
+## exports, so a model imported with the settings of an older version keeps the
+## physics it had; the other values are ready made repairs, see
+## [MMDPhysicsStrategy]. It is a starting point only: the value can be changed on
+## the node in the inspector.
+const OPTION_PHYSICS_STRATEGY := "mmd/physics_strategy"
+
 
 func _get_extensions() -> PackedStringArray:
 	return PackedStringArray(["pmx"])
@@ -55,6 +72,10 @@ func _get_extensions() -> PackedStringArray:
 func _get_import_options(_path: String) -> void:
 	add_import_option(OPTION_RUNTIME_SOLVER, true)
 	add_import_option(OPTION_PHYSICS, true)
+	# The labels follow the order of the enum, which is what the option stores.
+	add_import_option_advanced(TYPE_INT, OPTION_PHYSICS_STRATEGY,
+			MMDPhysicsStrategy.Preset.CUSTOM, PROPERTY_HINT_ENUM,
+			"Accurate (file values),Stable,Soft,Performance,Custom (node)")
 
 
 func _import_scene(path: String, _flags: int, options: Dictionary) -> Object:
@@ -64,7 +85,8 @@ func _import_scene(path: String, _flags: int, options: Dictionary) -> Object:
 	pmx_transform_to_godot(pmx)
 	var runtime_solver := bool(options.get(OPTION_RUNTIME_SOLVER, true))
 	var physics := bool(options.get(OPTION_PHYSICS, true))
-	return create_mesh_node(pmx, 0.1, path.get_base_dir(), runtime_solver, physics)
+	var strategy := int(options.get(OPTION_PHYSICS_STRATEGY, MMDPhysicsStrategy.Preset.CUSTOM))
+	return create_mesh_node(pmx, 0.1, path.get_base_dir(), runtime_solver, physics, strategy)
 
 
 func pmx_transform_to_godot(pmx):
@@ -86,7 +108,7 @@ func pmx_transform_to_godot(pmx):
 	pass
 
 
-func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solver: bool = true, physics: bool = true) -> Object:
+func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solver: bool = true, physics: bool = true, strategy: int = MMDPhysicsStrategy.Preset.CUSTOM) -> Object:
 	var scene = Node3D.new()
 	var root_node = Node3D.new()
 	var bone_node = Skeleton3D.new()
@@ -134,7 +156,7 @@ func create_mesh_node(pmx: PMXFile, scale: float, base_dir: String, runtime_solv
 		bone_node.set_bone_pose_position(i, position)
 
 	_create_pose_solver(pmx, bone_node, scene, runtime_solver)
-	_create_physics(pmx, bone_node, scene, physics, scale)
+	_create_physics(pmx, bone_node, scene, physics, scale, strategy)
 
 	# Create Skin
 	for bone in pmx.m_bones:
@@ -426,7 +448,7 @@ func _build_bone_data(pmx: PMXFile) -> Array:
 ## adds the runtime [MMDPhysicsSimulator] that drives them, unless the physics is
 ## disabled in the import dock. The bodies are what makes hair, skirts and breasts
 ## move: they are simulated and the result is written back into the bones.
-func _create_physics(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, enabled: bool, scale: float) -> void:
+func _create_physics(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, enabled: bool, scale: float, strategy: int = MMDPhysicsStrategy.Preset.CUSTOM) -> void:
 	if not enabled or pmx.m_rigidbodies.is_empty():
 		return
 	var data := _build_physics_data(pmx, scale)
@@ -436,9 +458,12 @@ func _create_physics(pmx: PMXFile, bone_node: Skeleton3D, scene: Node3D, enabled
 	var simulator := MMDPhysicsSimulator.new()
 	simulator.name = PHYSICS_NODE_NAME
 	simulator.set_influence(PHYSICS_INFLUENCE_VALUE)
+	simulator.preset = strategy
 	bone_node.add_child(simulator)
 	simulator.set_owner(scene)
-	print("MMD: %d rigid bodies, %d joints" % [data["rigid_bodies"].size(), data["joints"].size()])
+	print("MMD: %d rigid bodies, %d joints, strategy %s" % [
+		data["rigid_bodies"].size(), data["joints"].size(),
+		MMDPhysicsStrategy.preset_name(strategy)])
 
 
 ## Collects the rigid bodies (剛体) and the joints (ジョイント) of the file.
