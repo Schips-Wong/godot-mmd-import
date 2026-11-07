@@ -35,11 +35,12 @@ const PHYSICS_INFLUENCE_VALUE := 0.25
 ## [ArrayMesh] carries one blend shape per Position morph of the PMX file.
 const MORPH_NODE_NAME := "Morph"
 
-## Adds the runtime [MMDPoseSolver] node that applies 付与 (append) to motions
-## that do not contain it yet. Imported VMD motions are baked by [MMDPoseBaker]
-## and skipped by the solver, so the node is only needed for motions authored
-## elsewhere; disable it for models that only play baked motions. The bone data
-## metadata is written either way.
+## Adds the runtime [MMDPoseSolver] node that applies 付与 (append) and the IK
+## chains of the file while a motion plays, which is how MMD animates the model.
+## It is what makes an imported VMD motion bend the knees and follow the feet,
+## so keep it on unless every motion of the model is baked (see
+## [constant VMDImporter.OPTION_BAKE]). The bone data metadata is written either
+## way.
 const OPTION_RUNTIME_SOLVER := "mmd/runtime_pose_solver"
 
 ## Adds the runtime [MMDPhysicsSimulator] node that simulates the rigid bodies

@@ -13,6 +13,8 @@ About Godot MMD Plugin with gdscript
 - [ ] Generate Godot Softbody
 - [x] Parse VMD File
 - [x] Generate Godot Animation (bone)
+- [x] Solve IK and 付与 at runtime (MMDPoseSolver, motions stay blendable)
+- [x] Optional bake of the rules (import option "mmd/bake", self contained motions)
 - [ ] Generate Godot Animation (morph)
 - [ ] Generate Godot Animation (camera / light)
 - [ ] More Powerful

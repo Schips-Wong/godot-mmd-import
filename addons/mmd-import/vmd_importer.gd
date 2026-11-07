@@ -3,20 +3,26 @@ class_name VMDImporter extends EditorImportPlugin
 ## Imports MMD motion files (.vmd) as an [AnimationLibrary] holding one
 ## [Animation] with the bone motion of the file.
 ##
+## The keys are the ones of the file: the MMD pose rules (IK and 付与) are
+## [b]not[/b] baked at import time. They are solved on the skeleton every frame
+## by [MMDPoseSolver], the way MMD does it, so the motion stays blendable: an
+## [AnimationMixer] can cross fade, an [AnimationTree] can blend and seek, and
+## the keys keep the shape the file authored them with.
+##
 ## Godot stores bone poses as absolute local transforms, so the rest pose of the
 ## skeleton is needed to place the translation keys. The importer therefore
 ## looks for an already imported .pmx model (the reference model) that shares the
 ## most bone names with the motion file. Without a reference model only the
 ## rotation tracks are generated.
 ##
-## The MMD pose rules are precomputed: the reference skeleton is posed frame by
-## frame, the PMX IK chains and the 付与 (append) rules are evaluated and the
-## results are written into the animation as normal keys (see [MMDPoseBaker]).
-## The imported motion is self contained: it plays identically without a
-## [MMDPoseSolver] node, so exported games, exported glTF files and third party
-## projects get the correct pose from the keys alone. A solver that is still
-## present in the model detects baked motions and skips 付与 instead of applying
-## it twice.
+## The IK on/off switches of the file (VMD property key frames) are written into
+## the metadata [constant IK_TOGGLES_META] of the [Animation], so the runtime
+## solver can follow them.
+##
+## Set the import option [constant OPTION_BAKE] when the motion has to play
+## without the addon (glTF export, third party tools): the pose rules are then
+## sampled into the keys by [MMDPoseBaker] and the motion is marked so the
+## runtime solver does not apply them a second time.
 ##
 ## The track paths are "SkeletonNodePath:BoneName" relative to the player's
 ## root node, so the library can be played by any [AnimationMixer] whose
@@ -33,15 +39,18 @@ const OPTION_FPS := "mmd/fps"
 const OPTION_REFERENCE_MODEL := "mmd/reference_model"
 const OPTION_SKELETON_PATH := "mmd/skeleton_path"
 
-## How the MMD pose rules are baked into the motion.
-## [constant BAKE_IK] solves the IK chains of the reference model and bakes the
-## result together with 付与, which matches MMD the closest.
-## [constant BAKE_PLAIN] bakes only 付与 and keeps the rotation keys of the file,
-## so no IK correction is applied (useful when the IK result is not wanted, for
-## example for motions authored for another rig).
-const OPTION_BAKE_IK := "mmd/bake_ik"
-const BAKE_IK := 0
-const BAKE_PLAIN := 1
+## How the MMD pose rules reach the skeleton.
+## [constant BAKE_NONE] leaves them to [MMDPoseSolver] at runtime, which is what
+## MMD does and what keeps the motion blendable.
+## [constant BAKE_FULL] samples them into ordinary keys, so the motion plays
+## identically without any runtime node (exported glTF, third party projects).
+const OPTION_BAKE := "mmd/bake"
+const BAKE_NONE := 0
+const BAKE_FULL := 1
+
+## Metadata of the imported [Animation]: controller bone name -> array of
+## [code][time in seconds, enabled][/code]. Read by [MMDPoseSolver].
+const IK_TOGGLES_META := "mmd_ik_toggles"
 
 const VMD_EXTENSION := "vmd"
 const REFERENCE_SEARCH_DEPTH := 2
@@ -110,11 +119,10 @@ func _get_import_options(_path: String, _preset_index: int) -> Array[Dictionary]
 			"hint_string": "1,240,0.001",
 		},
 		{
-			"name": OPTION_BAKE_IK,
-			"default_value": BAKE_IK,
+			"name": OPTION_BAKE,
+			"default_value": BAKE_NONE,
 			"property_hint": PROPERTY_HINT_ENUM,
-			#"hint_string": "IK 解算烘焙,普通烘焙 (仅付与)",
-			"hint_string": "IK 解算烘焙",
+			"hint_string": "运行时解算 (可混合),烘焙 (自包含)",
 		},
 		{
 			"name": OPTION_REFERENCE_MODEL,
@@ -149,7 +157,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 	var fps := float(options.get(OPTION_FPS, 30.0))
 	var requested_reference := String(options.get(OPTION_REFERENCE_MODEL, ""))
 	var skeleton_path := String(options.get(OPTION_SKELETON_PATH, ""))
-	var bake_ik := int(options.get(OPTION_BAKE_IK, BAKE_IK)) != BAKE_PLAIN
+	var bake := int(options.get(OPTION_BAKE, BAKE_NONE)) == BAKE_FULL
 
 	print("MMD: motion '%s' (%s): %d bones, %d bone keys, %d morph keys, %d frames" % [
 		vmd.m_header.m_modelName,
@@ -170,7 +178,7 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 		skeleton_path = "Bone"
 
 	if skeleton == null:
-		push_warning("MMD: no reference model found for %s, only rotation tracks are imported and IK cannot be baked. Set '%s' in the import dock to bind translations and IK." % [source_file.get_file(), OPTION_REFERENCE_MODEL])
+		push_warning("MMD: no reference model found for %s, only rotation tracks are imported. Set '%s' in the import dock to bind translations." % [source_file.get_file(), OPTION_REFERENCE_MODEL])
 	else:
 		print("MMD: %d of %d animated bones found in the reference skeleton, bone tracks are relative to '%s'" % [
 			VMDAnimationBuilder.count_matching_bones(vmd, skeleton),
@@ -178,18 +186,13 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 			skeleton_path,
 		])
 
-	# 付与 is always baked, so the library is self contained: it needs no runtime
-	# solver and stays correct when the model is exported without this addon. A
-	# solver node in the model skips baked motions, so nothing is applied twice.
-	var bake_append := skeleton != null
-	if bake_append:
-		print("MMD: 付与 is baked into the motion, the library needs no runtime solver")
-	if not bake_ik:
-		print("MMD: IK solving is disabled, the rotation keys of the motion are kept")
-
 	var animation := VMDAnimationBuilder.build_bone_animation(vmd, skeleton, skeleton_path, scale, fps)
-	if animation != null and skeleton != null:
-		MMDPoseBaker.bake(vmd, skeleton, skeleton_path, scale, fps, animation, bake_append, bake_ik)
+	if animation != null:
+		_store_ik_toggles(animation, vmd, fps)
+		if bake and skeleton != null:
+			MMDPoseBaker.bake(vmd, skeleton, skeleton_path, scale, fps, animation, true, true)
+		elif bake:
+			push_warning("MMD: cannot bake %s without a reference model, the motion is solved at runtime instead" % source_file.get_file())
 	if reference != null:
 		reference.release()
 
@@ -211,6 +214,31 @@ func _import(source_file: String, save_path: String, options: Dictionary, _platf
 	if err != OK:
 		push_error("MMD: cannot save imported motion to %s" % path)
 	return err
+
+
+## Writes the IK on/off switches of the file into the motion, in seconds so the
+## runtime solver only has to compare it with the playback position.
+func _store_ik_toggles(animation: Animation, vmd: VMDFile, fps: float) -> void:
+	if vmd.m_propertyKeyFrames.is_empty():
+		return
+	var frame_rate := fps if fps > 0.0 else 30.0
+	var toggles := {}
+	for property_key in vmd.m_propertyKeyFrames:
+		var time := float(property_key.m_frame) / frame_rate
+		for ik_state in property_key.m_ikStates:
+			var name: String = ik_state[0]
+			if not toggles.has(name):
+				toggles[name] = []
+			toggles[name].append([time, bool(ik_state[1])])
+	if toggles.is_empty():
+		return
+	for name in toggles:
+		toggles[name].sort_custom(_sort_toggles)
+	animation.set_meta(IK_TOGGLES_META, toggles)
+
+
+static func _sort_toggles(a: Array, b: Array) -> bool:
+	return float(a[0]) < float(b[0])
 
 
 func _resolve_reference(vmd_path: String, requested: String, vmd: VMDFile) -> ReferenceModel:

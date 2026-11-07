@@ -1,57 +1,108 @@
 @tool
 class_name MMDPoseSolver extends SkeletonModifier3D
 
-## Applies the 付与 (append / grant) bone rule that plain [Animation] tracks
-## cannot express.
+## Applies the MMD pose rules that plain [Animation] tracks cannot express:
+## 付与 (append / grant) and IK.
 ##
-## A bone inherits a weighted part of another bone's animation transform (twist
-## bones, D bones, 肩C, 目戻...). Negative weights invert the inherited rotation.
-## Bones are processed in the PMX transform order.
+## [b]付与[/b]: a bone inherits a weighted part of another bone's animation
+## transform (twist bones, D bones, 肩C, 目戻...). Negative weights invert the
+## inherited rotation. Bones are processed in the PMX transform order.
 ##
-## IK is not solved at runtime: [VMDImporter] bakes the IK chains into ordinary
-## rotation tracks, see [MMDPoseBaker]. The 付与 rule is baked as well, so a
-## baked motion plays correctly without this node (exported game, glTF export,
-## third party tools). Animations carrying [constant MMDPoseBaker.BAKED_META]
-## already contain the rule result and are skipped here, otherwise the inherited
-## transform would be applied twice.
+## [b]IK[/b]: the chains of the PMX file (足ＩＫ -> ひざ -> 足 -> 足首) are solved
+## on the posed skeleton every frame by [MMDIKSolver], the way MMD does it. The
+## result is not baked into the motion, so the animation stays blendable: an
+## [AnimationMixer] can cross fade, an [AnimationTree] can blend and seek, and
+## the motion file keeps its original keys.
 ##
-## Baked motions are recognised through the [AnimationPlayer] that drives the
-## skeleton. Clips played through an [AnimationTree] leave that player's current
-## animation empty and are therefore not recognised: bake those clips and remove
-## this node, or keep them unbaked.
+## The IK on/off states of the motion (the property keys of the VMD file) are
+## carried by the imported [Animation] as the "mmd_ik_toggles" metadata
+## (see [constant IK_TOGGLES_META]) and evaluated at the playback time of the
+## [AnimationPlayer] that drives the skeleton. Motions played through an
+## [AnimationTree] have no readable time, so the chains stay enabled there.
+##
+## This node has to run after the [AnimationMixer] and before
+## [MMDPhysicsSimulator], which is why [PMXImporter] adds it first: the physics
+## places the rigid bodies on the final (solved) pose. The engine restores the
+## unmodified poses after the modifiers ran, so the skin uses the solved pose
+## while the animation keeps working on a clean pose every frame.
+##
+## A motion that already contains the rules (see [MMDPoseBaker], used by the
+## "MMD: 烘焙动画库" editor tool) is recognised by its [constant BAKED_META]
+## marker and skipped here, otherwise the inherited transform would be applied
+## twice.
 ##
 ## The bone data is written by [PMXImporter] into the [Skeleton3D] metadata
-## "mmd_bone_data". The engine runs this node after the [AnimationMixer] and
-## restores the unmodified poses afterwards, so the skin uses the solved pose
-## while the animation keeps working on a clean pose every frame.
+## "mmd_bone_data".
 
 const DATA_META := "mmd_bone_data"
 ## Mirrors [constant MMDPoseBaker.BAKED_META]; kept local so the solver does not
-## depend on the baker class being registered in exported projects.
+## depend on the baker class being registered in exported projects. Marks a
+## motion that already contains the 付与 result (and, for motions baked by older
+## versions of the importer, the IK result as well).
 const BAKED_META := "mmd_append_baked"
+## Marks a motion that already contains the IK result.
+const BAKED_IK_META := "mmd_ik_baked"
+## Metadata of an imported [Animation]: controller bone name -> array of
+## [code][time in seconds, enabled][/code]. Written by [VMDImporter].
+const IK_TOGGLES_META := "mmd_ik_toggles"
+
+## Applies the 付与 rule. Turn it off to inspect the raw motion of a file.
+@export var solve_append := true
+## Solves the IK chains. Turn it off for motions authored for another rig or to
+## inspect the keys of a file before the chains correct them.
+@export var solve_ik := true
 
 var _entries: Array = []
+## Controller bone name of every entry, "" when the entry has no IK chain. Kept
+## in the same order as [member _entries].
+var _ik_names: Array[String] = []
+## Controller bone name -> IK enabled, resolved once per frame.
+var _ik_states := {}
 var _bone_count := -1
-## "instance id/animation name" -> bool, see [method _plays_baked_animation].
+## "instance id/animation name" -> { "append": bool, "ik": bool },
+## see [method _baked_rules].
 var _baked_cache := {}
+## "instance id/animation name" -> sorted IK toggle data.
+var _toggle_cache := {}
 
 
 func _process_modification() -> void:
 	var skeleton := get_skeleton()
 	if skeleton == null:
 		return
-	if _plays_baked_animation(skeleton):
-		return
 	if _bone_count != skeleton.get_bone_count():
 		_build(skeleton)
-	for entry in _entries:
-		apply_append(skeleton, entry)
+	if _entries.is_empty():
+		return
+	var baked := _baked_rules(skeleton)
+	var do_append := solve_append and not bool(baked["append"])
+	var do_ik := solve_ik and not bool(baked["ik"])
+	if not do_append and not do_ik:
+		return
+	if do_ik:
+		_refresh_ik_states(skeleton)
+
+	# Same order as MMD: the 付与 rule of a bone runs first, then its IK chain.
+	# The cache of skeleton space poses has to be dropped after every change,
+	# because the engine only refreshes its global poses after all modifiers ran.
+	var global_cache := {}
+	for index in range(_entries.size()):
+		var entry: Dictionary = _entries[index]
+		if do_append and int(entry["append"]) >= 0:
+			apply_append(skeleton, entry)
+			global_cache.clear()
+		if do_ik and not _ik_names[index].is_empty():
+			if bool(_ik_states.get(_ik_names[index], true)):
+				MMDIKSolver.solve(skeleton, entry, global_cache)
 
 
 func _skeleton_changed(_old_skeleton: Skeleton3D, new_skeleton: Skeleton3D) -> void:
 	_bone_count = -1
 	_entries.clear()
+	_ik_names.clear()
+	_ik_states.clear()
 	_baked_cache.clear()
+	_toggle_cache.clear()
 	if new_skeleton != null:
 		_build(new_skeleton)
 
@@ -59,27 +110,123 @@ func _skeleton_changed(_old_skeleton: Skeleton3D, new_skeleton: Skeleton3D) -> v
 func _build(skeleton: Skeleton3D) -> void:
 	_bone_count = skeleton.get_bone_count()
 	_entries.clear()
+	_ik_names.clear()
+	_ik_states.clear()
+	_toggle_cache.clear()
 	if not skeleton.has_meta(DATA_META):
 		return
 	var data: Variant = skeleton.get_meta(DATA_META)
 	if not data is Array:
 		return
+	# Every bone with a rule, ordered like the PMX deform order so parents (and
+	# the bones a chain depends on) are handled before their children.
 	for entry in data:
-		if entry is Dictionary and int(entry["append"]) >= 0:
+		if not entry is Dictionary:
+			continue
+		if int(entry["append"]) >= 0 or int(entry["ik_target"]) >= 0:
 			_entries.append(entry)
 	_entries.sort_custom(sort_entries)
+	for entry in _entries:
+		var name := ""
+		var controller: int = int(entry["bone"])
+		if int(entry["ik_target"]) >= 0 and controller >= 0 and controller < _bone_count:
+			name = skeleton.get_bone_name(controller)
+			_ik_states[name] = true
+		_ik_names.append(name)
 
 
-## Returns true when every [AnimationPlayer] driving [param skeleton] plays a
-## motion that already contains the 付与 result (see [method MMDPoseBaker.bake]).
-## The rule must not run again in that case.
-func _plays_baked_animation(skeleton: Skeleton3D) -> bool:
+## Resolves the IK on/off state of every chain from the motion that plays.
+func _refresh_ik_states(skeleton: Skeleton3D) -> void:
+	var playback := _toggle_playback(skeleton)
+	if playback.is_empty():
+		return
+	var data: Dictionary = playback["data"]
+	var time: float = playback["time"]
+	for controller in data:
+		if _ik_states.has(controller):
+			_ik_states[controller] = _state_at(data[controller], time)
+
+
+## Returns { "data": sorted toggles, "time": playback position } of the motion
+## that drives [param skeleton], or an empty dictionary when it carries none.
+func _toggle_playback(skeleton: Skeleton3D) -> Dictionary:
+	for player in _driving_players(skeleton):
+		var animation_name := String(player.current_animation)
+		if animation_name.is_empty():
+			continue
+		var animation := _player_animation(player, animation_name)
+		if animation == null or not animation.has_meta(IK_TOGGLES_META):
+			continue
+		# The key holds the resource, not only its name: a reimported motion is a
+		# new [Animation] with new switches, while the name stays the same.
+		var cache_key := "%d/%d" % [player.get_instance_id(), animation.get_instance_id()]
+		if not _toggle_cache.has(cache_key):
+			_toggle_cache[cache_key] = _sort_toggles(animation.get_meta(IK_TOGGLES_META))
+		return {"data": _toggle_cache[cache_key], "time": player.current_animation_position}
+	return {}
+
+
+## Converts the "mmd_ik_toggles" metadata into time sorted arrays, so the state
+## of a frame can be looked up without walking the keys.
+static func _sort_toggles(raw: Variant) -> Dictionary:
+	var out := {}
+	if not raw is Dictionary:
+		return out
+	for controller in raw:
+		var pairs: Array = []
+		for key in raw[controller]:
+			if key is Array and key.size() >= 2:
+				pairs.append([float(key[0]), bool(key[1])])
+		pairs.sort_custom(_sort_toggle_pairs)
+		var times := PackedFloat64Array()
+		var states := PackedByteArray()
+		for pair in pairs:
+			times.append(pair[0])
+			states.append(1 if pair[1] else 0)
+		out[String(controller)] = {"times": times, "states": states}
+	return out
+
+
+static func _sort_toggle_pairs(a: Array, b: Array) -> bool:
+	return float(a[0]) < float(b[0])
+
+
+## Returns the state a chain has at [param time]: the last key at or before it,
+## enabled when the motion does not say anything yet.
+static func _state_at(state: Dictionary, time: float) -> bool:
+	var times: PackedFloat64Array = state["times"]
+	if times.is_empty() or time < times[0]:
+		return true
+	var states: PackedByteArray = state["states"]
+	var low := 0
+	var high := times.size() - 1
+	while low < high:
+		var middle := (low + high + 1) / 2
+		if times[middle] <= time:
+			low = middle
+		else:
+			high = middle - 1
+	return states[low] != 0
+
+
+## Returns which rule sets are already contained in the motions that
+## [param skeleton] plays: { "append": bool, "ik": bool }. A rule is only skipped
+## when every driving player plays a motion that contains it (see
+## [method MMDPoseBaker.bake]); otherwise the rule would be applied twice.
+func _baked_rules(skeleton: Skeleton3D) -> Dictionary:
+	var append_baked := true
+	var ik_baked := true
 	var driving := false
 	for player in _driving_players(skeleton):
 		driving = true
-		if not _player_plays_baked(player):
-			return false
-	return driving
+		var state := _player_baked_state(player)
+		if not bool(state["append"]):
+			append_baked = false
+		if not bool(state["ik"]):
+			ik_baked = false
+	if not driving:
+		return {"append": false, "ik": false}
+	return {"append": append_baked, "ik": ik_baked}
 
 
 ## Collects the players that can modify [param skeleton]: the node itself, an
@@ -112,17 +259,29 @@ func _add_player(node: Node, skeleton: Skeleton3D, players: Array, seen: Diction
 		players.append(player)
 
 
-func _player_plays_baked(player: AnimationPlayer) -> bool:
+## Returns { "append": bool, "ik": bool } for the motion [param player] plays.
+func _player_baked_state(player: AnimationPlayer) -> Dictionary:
 	var animation_name := String(player.current_animation)
 	if animation_name.is_empty():
-		return false
+		return {"append": false, "ik": false}
 	var cache_key := "%d/%s" % [player.get_instance_id(), animation_name]
 	if _baked_cache.has(cache_key):
 		return _baked_cache[cache_key]
 	var animation := _player_animation(player, animation_name)
-	var baked := animation != null and animation.has_meta(BAKED_META) and bool(animation.get_meta(BAKED_META))
-	_baked_cache[cache_key] = baked
-	return baked
+	var state := {"append": false, "ik": false}
+	if animation != null:
+		# The legacy marker was set by motions that contain both rules.
+		var legacy := _meta_true(animation, BAKED_META)
+		state = {
+			"append": legacy,
+			"ik": legacy or _meta_true(animation, BAKED_IK_META),
+		}
+	_baked_cache[cache_key] = state
+	return state
+
+
+static func _meta_true(resource: Resource, key: String) -> bool:
+	return resource.has_meta(key) and bool(resource.get_meta(key))
 
 
 static func _player_animation(player: AnimationPlayer, name: String) -> Animation:
